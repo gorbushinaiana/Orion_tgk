@@ -1,0 +1,424 @@
+import telebot
+import sqlite3
+import re
+import time
+import threading
+import datetime
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+
+bot = telebot.TeleBot(TOKEN)
+
+conn = sqlite3.connect("db.db", check_same_thread=False)
+cursor = conn.cursor()
+db_lock = threading.Lock()
+
+with db_lock:
+    # Миграция: если старая таблица users без chat_id — пересоздаём
+    cursor.execute("PRAGMA table_info(users)")
+    user_cols = {row[1] for row in cursor.fetchall()}
+    if user_cols and "chat_id" not in user_cols:
+        cursor.execute("DROP TABLE users")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER,
+        chat_id INTEGER,
+        username TEXT,
+        last_active INTEGER,
+        PRIMARY KEY(id, chat_id)
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        author INTEGER,
+        author_name TEXT,
+        link TEXT,
+        activity TEXT,
+        created INTEGER,
+        message_id INTEGER
+    )
+    """)
+
+    # Миграция: добавляем message_id если нет
+    cursor.execute("PRAGMA table_info(tasks)")
+    task_cols = {row[1] for row in cursor.fetchall()}
+    if "message_id" not in task_cols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN message_id INTEGER")
+
+    # Миграция: если старая таблица completions без поля time — пересоздаём
+    cursor.execute("PRAGMA table_info(completions)")
+    comp_cols = {row[1] for row in cursor.fetchall()}
+    if comp_cols and "time" not in comp_cols:
+        cursor.execute("DROP TABLE completions")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS completions(
+        task_id INTEGER,
+        chat_id INTEGER,
+        user_id INTEGER,
+        username TEXT,
+        time INTEGER,
+        verified INTEGER DEFAULT 0
+    )
+    """)
+
+    conn.commit()
+
+link_pattern = r"https:\/\/t\.me\/\S+"
+
+MSK = datetime.timezone(datetime.timedelta(hours=3))
+
+
+def msk_now():
+    return datetime.datetime.now(MSK)
+
+
+def is_working_hours():
+    now = msk_now()
+    day = now.weekday()  # 0=Пн, 4=Пт, 5=Сб, 6=Вс
+    hour = now.hour
+    if day == 0:  # Понедельник — с 7:00
+        return hour >= 7
+    elif 1 <= day <= 3:  # Вт–Чт — весь день
+        return True
+    elif day == 4:  # Пятница — до 23:00
+        return hour < 23
+    else:  # Сб–Вс
+        return False
+
+
+def is_admin(chat_id, user_id):
+    try:
+        status = bot.get_chat_member(chat_id, user_id).status
+        return status in ["administrator", "creator"]
+    except:
+        return False
+
+
+def task_link(chat_id, message_id):
+    """Строим ссылку на сообщение в супергруппе."""
+    if message_id and chat_id < 0:
+        cid = str(abs(chat_id))[3:]  # убираем префикс -100
+        return f"https://t.me/c/{cid}/{message_id}"
+    return None
+
+
+def keyboard(task_id):
+    markup = telebot.types.InlineKeyboardMarkup()
+    btn = telebot.types.InlineKeyboardButton(
+        "✅ Актив выполнен", callback_data=f"done_{task_id}"
+    )
+    markup.add(btn)
+    return markup
+
+
+@bot.message_handler(func=lambda m: True)
+def new_task(message):
+    if not message.text:
+        return
+
+    chat_id = message.chat.id
+    match = re.search(link_pattern, message.text)
+
+    if not match:
+        if not is_admin(chat_id, message.from_user.id):
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except:
+                pass
+        return
+
+    # Вне рабочих часов — не создаём задание, не удаляем сообщение
+    if not is_working_hours():
+        return
+
+    link = match.group()
+    activity = message.text.replace(link, "").strip() or "лайк"
+    now = int(time.time())
+
+    with db_lock:
+        cursor.execute(
+            """
+        SELECT COUNT(*) FROM tasks
+        WHERE author=? AND chat_id=? AND created>?
+        """,
+            (message.from_user.id, chat_id, now - 86400),
+        )
+        count = cursor.fetchone()[0]
+
+    if count >= 2:
+        bot.send_message(chat_id, "❗ Лимит 2 задания в сутки")
+        return
+
+    with db_lock:
+        cursor.execute(
+            """
+        INSERT INTO tasks(chat_id,author,author_name,link,activity,created)
+        VALUES (?,?,?,?,?,?)
+        """,
+            (
+                chat_id,
+                message.from_user.id,
+                message.from_user.username,
+                link,
+                activity,
+                now,
+            ),
+        )
+        task_id = cursor.lastrowid
+        conn.commit()
+
+    sent = bot.send_message(
+        chat_id,
+        f"📢 Новое задание\n\n@{message.from_user.username}\n{link}\n{activity}",
+        reply_markup=keyboard(task_id),
+    )
+
+    with db_lock:
+        cursor.execute(
+            "UPDATE tasks SET message_id=? WHERE id=?", (sent.message_id, task_id)
+        )
+        conn.commit()
+
+    if not is_admin(chat_id, message.from_user.id):
+        try:
+            bot.delete_message(chat_id, message.message_id)
+        except:
+            pass
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
+def done(call):
+    task_id = int(call.data.split("_")[1])
+    now = int(time.time())
+
+    with db_lock:
+        cursor.execute("SELECT created, chat_id FROM tasks WHERE id=?", (task_id,))
+        task = cursor.fetchone()
+
+    if not task:
+        try:
+            bot.answer_callback_query(call.id, "Задание не найдено")
+        except:
+            pass
+        return
+
+    created, chat_id = task
+
+    if now - created < 10:
+        try:
+            bot.answer_callback_query(call.id, "⚠️ Слишком быстро")
+        except:
+            pass
+        return
+
+    with db_lock:
+        cursor.execute(
+            """
+        SELECT * FROM completions
+        WHERE task_id=? AND user_id=? AND chat_id=?
+        """,
+            (task_id, call.from_user.id, chat_id),
+        )
+        already = cursor.fetchone()
+
+    if already:
+        try:
+            bot.answer_callback_query(call.id, "Уже отмечено")
+        except:
+            pass
+        return
+
+    # Сначала отвечаем Telegram — чтобы кнопка не зависала
+    try:
+        bot.answer_callback_query(call.id, "Засчитано ✅")
+    except:
+        pass
+
+    with db_lock:
+        cursor.execute(
+            """
+        INSERT INTO completions(task_id,chat_id,user_id,username,time)
+        VALUES (?,?,?,?,?)
+        """,
+            (task_id, chat_id, call.from_user.id, call.from_user.username, now),
+        )
+
+        cursor.execute(
+            """
+        INSERT OR REPLACE INTO users(id,chat_id,username,last_active)
+        VALUES (?,?,?,?)
+        """,
+            (call.from_user.id, chat_id, call.from_user.username, now),
+        )
+
+        conn.commit()
+
+
+def scheduler():
+    weekly_reported = set()
+    friday_notified = set()
+    monday_notified = set()
+
+    while True:
+        now = int(time.time())
+        now_dt = msk_now()
+        day = now_dt.weekday()  # 0=Пн, 4=Пт, 5=Сб, 6=Вс
+        hour = now_dt.hour
+        week_num = now_dt.isocalendar()[1]
+
+        # Получаем все чаты из базы (tasks + users)
+        with db_lock:
+            cursor.execute("SELECT DISTINCT chat_id FROM users")
+            all_chats = {r[0] for r in cursor.fetchall()}
+            cursor.execute("SELECT DISTINCT chat_id FROM tasks")
+            all_chats |= {r[0] for r in cursor.fetchall()}
+
+        for chat_id in all_chats:
+            # --- Пятница 23:00 — уходим на выходные ---
+            fri_key = (chat_id, week_num)
+            if day == 4 and hour == 23 and fri_key not in friday_notified:
+                try:
+                    bot.send_message(
+                        chat_id, "🌙 Пост-чат ушел на выходные! Актив по желанию"
+                    )
+                    friday_notified.add(fri_key)
+                except Exception as e:
+                    print(f"Friday notify error: {e}")
+
+            # --- Понедельник 7:00 — начало недели ---
+            mon_key = (chat_id, week_num)
+            if day == 0 and hour == 7 and mon_key not in monday_notified:
+                try:
+                    bot.send_message(
+                        chat_id, "☀️ Доброе утро, пост-чат работает в нормальном режиме"
+                    )
+                    monday_notified.add(mon_key)
+                except Exception as e:
+                    print(f"Monday notify error: {e}")
+
+            # --- Истёкшие задания (только в рабочее время) ---
+            with db_lock:
+                cursor.execute(
+                    """
+                SELECT id, created, author_name, message_id FROM tasks
+                WHERE chat_id=?
+                """,
+                    (chat_id,),
+                )
+                tasks = cursor.fetchall()
+
+            for t in tasks:
+                task_id, created, author, msg_id = t
+
+                if now - created > 86400 and is_working_hours():
+                    with db_lock:
+                        cursor.execute(
+                            """
+                        SELECT username FROM completions
+                        WHERE task_id=? AND chat_id=?
+                        """,
+                            (task_id, chat_id),
+                        )
+                        done_users = {x[0] for x in cursor.fetchall()}
+
+                        cursor.execute(
+                            """
+                        SELECT username FROM users WHERE chat_id=?
+                        """,
+                            (chat_id,),
+                        )
+                        all_users = {x[0] for x in cursor.fetchall()}
+
+                    not_done = all_users - done_users
+
+                    link = task_link(chat_id, msg_id)
+                    if not_done:
+                        text = "❌ Не выполнили задание"
+                        if link:
+                            text += f" ({link})"
+                        text += ":\n\n"
+                        text += "\n".join([f"@{u}" for u in not_done if u])
+                    else:
+                        text = "✅ Все выполнили задание"
+                        if link:
+                            text += f" ({link})"
+
+                    try:
+                        bot.send_message(chat_id, text)
+                    except Exception as e:
+                        print(f"Task expiry error: {e}")
+
+                    with db_lock:
+                        cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+                        conn.commit()
+
+            # --- Недельный отчёт — воскресенье в 20:00 по МСК ---
+            week_key = (chat_id, week_num)
+            if day == 6 and hour == 20 and week_key not in weekly_reported:
+                week_ago = now - 604800
+
+                with db_lock:
+                    cursor.execute(
+                        """
+                    SELECT username FROM users
+                    WHERE chat_id=? AND last_active<?
+                    """,
+                        (chat_id, week_ago),
+                    )
+                    inactive = [f"@{x[0]}" for x in cursor.fetchall() if x[0]]
+
+                    cursor.execute(
+                        """
+                    SELECT username, COUNT(*) as c
+                    FROM completions WHERE chat_id=?
+                    GROUP BY user_id ORDER BY c DESC LIMIT 5
+                    """,
+                        (chat_id,),
+                    )
+                    top = cursor.fetchall()
+
+                text = "📊 Недельный отчёт\n\n"
+                if inactive:
+                    text += "❌ Неактивные:\n" + "\n".join(inactive) + "\n\n"
+                if top:
+                    text += "🏆 Топ:\n"
+                    for t in top:
+                        text += f"@{t[0]} — {t[1]}\n"
+
+                try:
+                    bot.send_message(chat_id, text)
+                    weekly_reported.add(week_key)
+                except Exception as e:
+                    print(f"Weekly report error: {e}")
+
+        time.sleep(60)
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
+threading.Thread(target=run_health_server, daemon=True).start()
+threading.Thread(target=scheduler, daemon=True).start()
+
+print("Bot started...")
+bot.infinity_polling()
