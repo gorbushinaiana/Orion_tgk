@@ -9,7 +9,7 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----- Токен (временное решение, позже вернём через переменную окружения) -----
-TOKEN = "8660329563:AAFBfYcdpmv1GkyF02ahPmyxuGpAftra-3w"
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 # ----- Инициализация бота с увеличенным таймаутом -----
 bot = telebot.TeleBot(TOKEN, timeout=30)
