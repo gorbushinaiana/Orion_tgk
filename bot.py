@@ -9,10 +9,10 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----- Токен (временное решение, позже вернём через переменную окружения) -----
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TOKEN = "8660329563:AAFBfYcdpmv1GkyF02ahPmyxuGpAftra-3w"
 
 # ----- Инициализация бота с увеличенным таймаутом -----
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, timeout=30)
 
 # ----- Проверка соединения с Telegram перед стартом -----
 print("Проверяю соединение с Telegram API...")
@@ -356,6 +356,7 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 threading.Thread(target=scheduler, daemon=True).start()
+
 
 print("Бот запущен...")
 bot.infinity_polling()
