@@ -8,22 +8,17 @@ import os
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ----- Токен (временное решение, позже вернём через переменную окружения) -----
-TOKEN = "8660329563:AAFBfYcdpmv1GkyF02ahPmyxuGpAftra-3w"
-
-# ----- Инициализация бота с увеличенным таймаутом -----
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 bot = telebot.TeleBot(TOKEN)
 
-# ----- Проверка соединения с Telegram перед стартом -----
 print("Проверяю соединение с Telegram API...")
 try:
     me = bot.get_me()
     print(f"✅ Бот подключён: @{me.username}")
 except Exception as e:
-    print(f"❌ Не удалось подключиться к Telegram API: {e}")
+    print(f"❌ Ошибка: {e}")
     sys.exit(1)
 
-# ----- Остальной код без изменений (база данных, обработчики, планировщик) -----
 conn = sqlite3.connect("db.db", check_same_thread=False)
 cursor = conn.cursor()
 db_lock = threading.Lock()
@@ -63,7 +58,6 @@ with db_lock:
     conn.commit()
 
 link_pattern = r"https://t.me/\S+"
-
 MSK = datetime.timezone(datetime.timedelta(hours=3))
 
 def msk_now():
@@ -79,7 +73,7 @@ def is_work_time(post_time):
         return True
     elif weekday == 4:      # пятница
         return hour < 23
-    else:                   # суббота, воскресенье
+    else:
         return False
 
 def is_admin(chat_id, user_id):
@@ -91,7 +85,7 @@ def is_admin(chat_id, user_id):
 
 def task_link(chat_id, message_id):
     if message_id and chat_id < 0:
-        cid = str(abs(chat_id))[3:]  # убираем -100
+        cid = str(abs(chat_id))[3:]
         return f"https://t.me/c/{cid}/{message_id}"
     return None
 
@@ -106,7 +100,6 @@ def keyboard(task_id):
 def new_task(message):
     if not message.text:
         return
-
     chat_id = message.chat.id
     match = re.search(link_pattern, message.text)
     if not match:
@@ -116,10 +109,8 @@ def new_task(message):
             except:
                 pass
         return
-
     if not is_work_time(message.date):
         return
-
     link = match.group()
     activity = message.text.replace(link, "").strip() or "лайк"
     now = int(time.time())
@@ -205,12 +196,7 @@ def done(call):
         )
         conn.commit()
 
-    try:
-        
-    except:
-        pass
-
-# ---------- Планировщик (без изменений) ----------
+# ---------- Планировщик ----------
 def scheduler():
     weekly_reported = set()
     friday_notified = set()
@@ -230,7 +216,7 @@ def scheduler():
             chats |= {r[0] for r in cursor.fetchall()}
 
         for chat_id in chats:
-            # --- Пятница 23:00 ---
+            # Пятница 23:00
             fri_key = (chat_id, week_num)
             if day == 4 and hour == 23 and fri_key not in friday_notified:
                 try:
@@ -239,7 +225,7 @@ def scheduler():
                     pass
                 friday_notified.add(fri_key)
 
-            # --- Понедельник 7:00 ---
+            # Понедельник 7:00
             mon_key = (chat_id, week_num)
             if day == 0 and hour == 7 and mon_key not in monday_notified:
                 try:
@@ -248,7 +234,7 @@ def scheduler():
                     pass
                 monday_notified.add(mon_key)
 
-            # --- Истекшие задания (24 часа) ---
+            # Истекшие задания (5 минут)
             with db_lock:
                 cursor.execute(
                     "SELECT id, created, author, author_name, message_id, link FROM tasks WHERE chat_id=?",
@@ -258,7 +244,7 @@ def scheduler():
 
             for task in tasks:
                 task_id, created, author_id, author_name, msg_id, link = task
-                if now - created > 86400:
+                if now - created > 300:   # 5 минут
                     with db_lock:
                         cursor.execute(
                             "SELECT username FROM completions WHERE task_id=? AND chat_id=?",
@@ -302,7 +288,7 @@ def scheduler():
                         cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                         conn.commit()
 
-            # --- Недельный отчёт (воскресенье 12:00) ---
+            # Недельный отчёт (воскресенье 12:00)
             week_key = (chat_id, week_num)
             if day == 6 and hour == 12 and week_key not in weekly_reported:
                 week_ago = now - 604800
@@ -353,7 +339,6 @@ def run_health_server():
 
 threading.Thread(target=run_health_server, daemon=True).start()
 threading.Thread(target=scheduler, daemon=True).start()
-
 
 print("Бот запущен...")
 bot.infinity_polling()
