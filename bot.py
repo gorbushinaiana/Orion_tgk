@@ -7,7 +7,7 @@ import datetime
 import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-TOKEN = ["8660329563:AAFBfYcdpmv1GkyF02ahPmyxuGpAftra-3w"]
+TOKEN = "8660329563:AAFBfYcdpmv1GkyF02ahPmyxuGpAftra-3w"
 bot = telebot.TeleBot(TOKEN)
 
 conn = sqlite3.connect("db.db", check_same_thread=False)
