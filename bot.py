@@ -244,7 +244,7 @@ def scheduler():
 
             for task in tasks:
                 task_id, created, author_id, author_name, msg_id, link = task
-                if now - created > 300:   # 5 минут
+                if now - created > 86400:   # 24 часа
                     with db_lock:
                         cursor.execute(
                             "SELECT username FROM completions WHERE task_id=? AND chat_id=?",
