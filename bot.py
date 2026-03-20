@@ -12,7 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 # ----- Инициализация бота с увеличенным таймаутом -----
-bot = telebot.TeleBot(TOKEN, timeout=30)
+bot = telebot.TeleBot(TOKEN)
 
 # ----- Проверка соединения с Telegram перед стартом -----
 print("Проверяю соединение с Telegram API...")
