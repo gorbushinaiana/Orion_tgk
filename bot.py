@@ -5,11 +5,25 @@ import time
 import threading
 import datetime
 import os
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# ----- Токен (временное решение, позже вернём через переменную окружения) -----
 TOKEN = "8660329563:AAFBfYcdpmv1GkyF02ahPmyxuGpAftra-3w"
-bot = telebot.TeleBot(TOKEN)
 
+# ----- Инициализация бота с увеличенным таймаутом -----
+bot = telebot.TeleBot(TOKEN, timeout=30)
+
+# ----- Проверка соединения с Telegram перед стартом -----
+print("Проверяю соединение с Telegram API...")
+try:
+    me = bot.get_me()
+    print(f"✅ Бот подключён: @{me.username}")
+except Exception as e:
+    print(f"❌ Не удалось подключиться к Telegram API: {e}")
+    sys.exit(1)
+
+# ----- Остальной код без изменений (база данных, обработчики, планировщик) -----
 conn = sqlite3.connect("db.db", check_same_thread=False)
 cursor = conn.cursor()
 db_lock = threading.Lock()
@@ -176,7 +190,6 @@ def done(call):
             bot.answer_callback_query(call.id, "Уже отмечено")
             return
 
-    # Проверка кликов отключена – всегда засчитываем
     bot.answer_callback_query(call.id, "Засчитано ✅")
 
     with db_lock:
@@ -192,7 +205,6 @@ def done(call):
         )
         conn.commit()
 
-    # Уведомление в чат о выполнении
     try:
         bot.send_message(
             chat_id,
@@ -201,7 +213,7 @@ def done(call):
     except:
         pass
 
-# ---------- Планировщик ----------
+# ---------- Планировщик (без изменений) ----------
 def scheduler():
     weekly_reported = set()
     friday_notified = set()
