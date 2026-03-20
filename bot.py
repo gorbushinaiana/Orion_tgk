@@ -206,10 +206,7 @@ def done(call):
         conn.commit()
 
     try:
-        bot.send_message(
-            chat_id,
-            f"✅ Пользователь @{call.from_user.username} выполнил задание."
-        )
+        
     except:
         pass
 
