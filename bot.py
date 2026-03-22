@@ -9,7 +9,7 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, timeout=30, request_timeout=30)
 
 print("Проверяю соединение с Telegram API...")
 try:
@@ -97,17 +97,24 @@ def keyboard(task_id):
     return markup
 
 @bot.message_handler(func=lambda m: True)
-def new_task(message):
+def handle_message(message):
     if not message.text:
         return
+
     chat_id = message.chat.id
-    match = re.search(link_pattern, message.text)
-    if not match:
-        if not is_admin(chat_id, message.from_user.id):
-            try:
-                bot.delete_message(chat_id, message.message_id)
-            except:
-                pass
+    user_id = message.from_user.id
+    username = message.from_user.username or f"id{user_id}"
+    is_user_admin = is_admin(chat_id, user_id)
+
+    # ---- Добавляем/обновляем пользователя в БД (даже если сообщение будет удалено) ----
+    now = int(time.time())
+    with db_lock:
+        cursor.execute(
+            "INSERT INTO users (id, chat_id, username, last_active) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(id, chat_id) DO UPDATE SET username=excluded.username, last_active=excluded.last_active",
+            (user_id, chat_id, username, now)
+        )
+        conn.commit()
         return
     if not is_work_time(message.date):
         return
