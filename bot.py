@@ -11,6 +11,18 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 bot = telebot.TeleBot(TOKEN)
 
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    if message.chat.type == "private":
+        bot.send_message(
+            message.chat.id,
+            "👋 Привет! Я бот для взаимной активности.\n\n"
+            "📌 Правила:\n"
+            "• Отправляй ссылки на посты в чат – я создам задание.\n"
+            "• Выполнив задание, нажми кнопку под ним.\n"
+            "• Чтобы узнать свои невыполненные задания, напиши /my_tasks в личку.\n\n"
+            "Если есть вопросы – пиши администратору."
+        )
 # --- Принудительный сброс webhook и pending updates через прямой запрос ---
 def reset_telegram_webhook(token):
     try:
@@ -112,7 +124,6 @@ def keyboard(task_id):
 # Обработчик команды my_tasks
 @bot.message_handler(commands=['my_tasks'])
 def my_tasks(message):
-    print(f"DEBUG: /my_tasks from {message.from_user.id} in chat {message.chat.id} type {message.chat.type}")
     if message.chat.type != "private":
         return
 
@@ -124,43 +135,41 @@ def my_tasks(message):
             SELECT t.chat_id, t.id, t.link, t.activity, t.author_name, t.message_id
             FROM tasks t
             WHERE t.created > ?
+              AND t.author != ?
               AND NOT EXISTS (
                   SELECT 1 FROM completions c
                   WHERE c.task_id = t.id AND c.user_id = ?
               )
             ORDER BY t.created DESC
-        """, (now - 86400, user_id))
+        """, (now - 86400, user_id, user_id))
         tasks = cursor.fetchall()
 
     if not tasks:
         bot.send_message(user_id, "✅ У вас нет активных невыполненных заданий.")
         return
 
-    # Отфильтровываем чаты, где пользователь не состоит
+    # Фильтруем чаты, где пользователь состоит и не является администратором
     filtered = []
     for task in tasks:
         chat_id = task[0]
         try:
-            bot.get_chat_member(chat_id, user_id)
+            member = bot.get_chat_member(chat_id, user_id)
+            # Пользователь не должен быть вышедшим или удалённым
+            if member.status in ["left", "kicked"]:
+                continue
+            # Если не хотим показывать задания администраторам (даже если они не создавали)
+            if member.status in ["administrator", "creator"]:
+                continue
             filtered.append(task)
-        except:
+        except Exception as e:
+            # Если пользователь не в чате или бот не может получить информацию, пропускаем
             continue
 
     if not filtered:
         bot.send_message(user_id, "✅ У вас нет активных невыполненных заданий.")
         return
 
-    chats = {}
-    for chat_id, task_id, link, activity, author_name, msg_id in filtered:
-        if chat_id not in chats:
-            try:
-                chat = bot.get_chat(chat_id)
-                chat_title = chat.title if chat.title else f"Чат {chat_id}"
-            except:
-                chat_title = f"Чат {chat_id}"
-            chats[chat_id] = {'title': chat_title, 'tasks': []}
-        chats[chat_id]['tasks'].append((task_id, link, activity, author_name, msg_id))
-
+    # Далее формирование ответа (без изменений)
     # Формируем ответ (только ссылки)
     response = "📋 *Ваши активные задания:*\n\n"
     for chat_id, data in chats.items():
