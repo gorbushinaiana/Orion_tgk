@@ -103,6 +103,13 @@ def keyboard(task_id):
         "✅ Актив выполнен", callback_data=f"done_{task_id}"
     ))
     return markup
+@bot.message_handler(commands=['my_tasks'])
+def my_tasks(message):
+    print(f"DEBUG: Получена команда /my_tasks от {message.from_user.id} в чате {message.chat.id} типа {message.chat.type}")
+    if message.chat.type != "private":
+        print("Не личный чат, игнорируем")
+        return
+    # остальной код функции без изменений...
 
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
