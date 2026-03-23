@@ -447,8 +447,18 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
-threading.Thread(target=run_health_server, daemon=True).start()
-threading.Thread(target=scheduler, daemon=True).start()
+# ---------- Запуск бота ----------
+if __name__ == "__main__":
+    threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=scheduler, daemon=True).start()
 
-print("Бот запущен...")
-bot.infinity_polling(timeout=30, long_polling_timeout=30)
+    # Принудительный сброс webhook
+    try:
+        bot.remove_webhook()
+        print("Webhook removed")
+        time.sleep(2)
+    except Exception as e:
+        print(f"Error removing webhook: {e}")
+
+    print("Бот запущен...")
+    bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
