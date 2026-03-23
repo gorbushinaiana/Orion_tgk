@@ -138,23 +138,25 @@ def handle_message(message):
     link = match.group()
     activity = message.text.replace(link, "").strip() or "лайк"
 
-    # ---- Лимит: 1 задание в сутки ----
-    now = int(time.time())
-    with db_lock:
-        cursor.execute(
-            "SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?",
-            (user_id, chat_id, now - 86400)
-        )
-        if cursor.fetchone()[0] >= 1:
-            bot.send_message(chat_id, f"❗ @{username}, лимит 1 задание в сутки исчерпан. Задание не создано.")
-            if not is_user_admin:
-                try:
-                    bot.delete_message(chat_id, message.message_id)
-                except:
-                    pass
-            return
+    # ---- Лимит: 1 задание в сутки (не для администраторов) ----
+    if not is_user_admin:
+        now = int(time.time())
+        with db_lock:
+            cursor.execute(
+                "SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?",
+                (user_id, chat_id, now - 86400)
+            )
+            if cursor.fetchone()[0] >= 1:
+                bot.send_message(chat_id, f"❗ @{username}, лимит 1 задание в сутки исчерпан. Задание не создано.")
+                if not is_user_admin:
+                    try:
+                        bot.delete_message(chat_id, message.message_id)
+                    except:
+                        pass
+                return
 
     # ---- Создаём задание ----
+    now = int(time.time())
     with db_lock:
         cursor.execute(
             "INSERT INTO tasks (chat_id, author, author_name, link, activity, created) "
@@ -375,3 +377,4 @@ threading.Thread(target=scheduler, daemon=True).start()
 
 print("Бот запущен...")
 bot.infinity_polling(timeout=30, long_polling_timeout=30)
+
