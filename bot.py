@@ -83,10 +83,12 @@ def is_admin(chat_id, user_id):
         admin_list = [int(x.strip()) for x in admin_ids.split(",") if x.strip().isdigit()]
         if user_id in admin_list:
             return True
+
+    # Иначе пробуем получить статус через API
     try:
         status = bot.get_chat_member(chat_id, user_id).status
         return status in ["administrator", "creator"]
-    except:
+    except Exception:
         return False
 
 def task_link(chat_id, message_id):
@@ -102,61 +104,10 @@ def keyboard(task_id):
     ))
     return markup
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(message.chat.id, "Привет! Я бот для взаимной активности. Напишите /my_tasks, чтобы увидеть список невыполненных заданий.")
-
-@bot.message_handler(commands=['my_tasks'])
-def my_tasks(message):
-    user_id = message.from_user.id
-    now = int(time.time())
-
-    with db_lock:
-        cursor.execute("""
-            SELECT t.chat_id, t.id, t.link, t.activity, t.author_name, t.message_id
-            FROM tasks t
-            WHERE t.created > ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM completions c
-                  WHERE c.task_id = t.id AND c.user_id = ?
-              )
-            ORDER BY t.created DESC
-        """, (now - 86400, user_id))
-        tasks = cursor.fetchall()
-
-    if not tasks:
-        bot.send_message(user_id, "✅ У вас нет активных невыполненных заданий.")
-        return
-
-    chats = {}
-    for chat_id, task_id, link, activity, author_name, msg_id in tasks:
-        if chat_id not in chats:
-            try:
-                chat = bot.get_chat(chat_id)
-                chat_title = chat.title if chat.title else f"Чат {chat_id}"
-            except:
-                chat_title = f"Чат {chat_id}"
-            chats[chat_id] = {'title': chat_title, 'tasks': []}
-        chats[chat_id]['tasks'].append((task_id, link, activity, author_name, msg_id))
-
-    response = "📋 *Ваши активные задания:*\n\n"
-    for chat_id, data in chats.items():
-        response += f"*{data['title']}*:\n"
-        for task_id, link, activity, author_name, msg_id in data['tasks']:
-            msg_link = task_link(chat_id, msg_id) or link
-            response += f"• [{activity}]({msg_link}) — от @{author_name}\n"
-        response += "\n"
-    response += "Нажмите на ссылку, чтобы перейти к заданию, затем выполните его и нажмите кнопку ✅ Актив выполнен."
-
-    try:
-        bot.send_message(user_id, response, parse_mode='Markdown', disable_web_page_preview=True)
-    except Exception:
-        bot.send_message(user_id, response.replace('*', ''), disable_web_page_preview=True)
-
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
-    # Игнорируем личные сообщения
-    if message.chat.type == 'private':
+    # Игнорируем личные сообщения (чат с ботом)
+    if message.chat.type in ["private"]:
         return
 
     if not message.text:
@@ -167,7 +118,7 @@ def handle_message(message):
     username = message.from_user.username or f"id{user_id}"
     is_user_admin = is_admin(chat_id, user_id)
 
-    # ---- Добавляем/обновляем пользователя в БД (даже если сообщение будет удалено) ----
+    # Добавляем пользователя в БД (даже если сообщение будет удалено)
     now = int(time.time())
     with db_lock:
         cursor.execute(
@@ -177,7 +128,7 @@ def handle_message(message):
         )
         conn.commit()
 
-    # ---- Удаление сообщений в нерабочее время (выходные) ----
+    # Удаление сообщений в нерабочее время (выходные)
     if not is_work_time(message.date):
         if not is_user_admin:
             try:
@@ -186,7 +137,7 @@ def handle_message(message):
                 pass
         return
 
-    # ---- Поиск ссылки ----
+    # Поиск ссылки
     match = re.search(link_pattern, message.text)
     if not match:
         if not is_user_admin:
@@ -199,9 +150,8 @@ def handle_message(message):
     link = match.group()
     activity = message.text.replace(link, "").strip() or "лайк"
 
-    # ---- Лимит: 1 задание в сутки (не для администраторов) ----
+    # Лимит: 1 задание в сутки (не для администраторов)
     if not is_user_admin:
-        now = int(time.time())
         with db_lock:
             cursor.execute(
                 "SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?",
@@ -215,8 +165,7 @@ def handle_message(message):
                     pass
                 return
 
-    # ---- Создаём задание ----
-    now = int(time.time())
+    # Создаём задание
     with db_lock:
         cursor.execute(
             "INSERT INTO tasks (chat_id, author, author_name, link, activity, created) "
@@ -253,17 +202,17 @@ def done(call):
         task = cursor.fetchone()
 
     if not task:
-        bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id, "Задание не найдено")
         return
 
     created, chat_id, author_id = task
 
     if call.from_user.id == author_id:
-        bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id, "Нельзя выполнить своё задание")
         return
 
     if now - created < 10:
-        bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id, "Подождите 10 секунд")
         return
 
     with db_lock:
@@ -272,11 +221,10 @@ def done(call):
             (task_id, call.from_user.id, chat_id)
         )
         if cursor.fetchone():
-            bot.answer_callback_query(call.id)
+            bot.answer_callback_query(call.id, "Уже отмечено")
             return
 
-    # Засчитываем выполнение
-    with db_lock:
+        # Засчитываем выполнение
         cursor.execute(
             "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) "
             "VALUES (?, ?, ?, ?, ?, 1)",
@@ -291,6 +239,73 @@ def done(call):
 
     # Тихо отвечаем на callback (без всплывающего уведомления)
     bot.answer_callback_query(call.id)
+
+# ---- Команда для получения списка невыполненных заданий ----
+@bot.message_handler(commands=['my_tasks'])
+def my_tasks(message):
+    # Команда должна работать только в личных сообщениях
+    if message.chat.type != "private":
+        return
+
+    user_id = message.from_user.id
+    now = int(time.time())
+
+    with db_lock:
+        cursor.execute("""
+            SELECT t.chat_id, t.id, t.link, t.activity, t.author_name, t.message_id
+            FROM tasks t
+            WHERE t.created > ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM completions c
+                  WHERE c.task_id = t.id AND c.user_id = ?
+              )
+            ORDER BY t.created DESC
+        """, (now - 86400, user_id))
+        tasks = cursor.fetchall()
+
+    if not tasks:
+        bot.send_message(user_id, "✅ У вас нет активных невыполненных заданий.")
+        return
+
+    # Отфильтровываем чаты, где пользователь не является участником
+    filtered_tasks = []
+    for task in tasks:
+        chat_id = task[0]
+        try:
+            member = bot.get_chat_member(chat_id, user_id)
+            # Если пользователь не в чате, будет исключение
+            filtered_tasks.append(task)
+        except Exception:
+            continue
+
+    if not filtered_tasks:
+        bot.send_message(user_id, "✅ У вас нет активных невыполненных заданий.")
+        return
+
+    chats = {}
+    for chat_id, task_id, link, activity, author_name, msg_id in filtered_tasks:
+        if chat_id not in chats:
+            try:
+                chat = bot.get_chat(chat_id)
+                chat_title = chat.title if chat.title else f"Чат {chat_id}"
+            except:
+                chat_title = f"Чат {chat_id}"
+            chats[chat_id] = {'title': chat_title, 'tasks': []}
+        chats[chat_id]['tasks'].append((task_id, link, activity, author_name, msg_id))
+
+    response = "📋 *Ваши активные задания:*\n\n"
+    for chat_id, data in chats.items():
+        response += f"*{data['title']}*:\n"
+        for task_id, link, activity, author_name, msg_id in data['tasks']:
+            msg_link = task_link(chat_id, msg_id) or link
+            response += f"• [{activity}]({msg_link}) — от @{author_name}\n"
+        response += "\n"
+    response += "Нажмите на ссылку, чтобы перейти к заданию, затем выполните его и нажмите кнопку ✅ Актив выполнен."
+
+    try:
+        bot.send_message(user_id, response, parse_mode='Markdown', disable_web_page_preview=True)
+    except Exception:
+        bot.send_message(user_id, response.replace('*', ''), disable_web_page_preview=True)
 
 # ---------- Планировщик ----------
 def scheduler():
