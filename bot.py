@@ -136,6 +136,7 @@ def my_tasks(message):
         bot.send_message(user_id, "✅ У вас нет активных невыполненных заданий.")
         return
 
+    # Отфильтровываем чаты, где пользователь не состоит
     filtered = []
     for task in tasks:
         chat_id = task[0]
@@ -160,7 +161,8 @@ def my_tasks(message):
             chats[chat_id] = {'title': chat_title, 'tasks': []}
         chats[chat_id]['tasks'].append((task_id, link, activity, author_name, msg_id))
 
-     response = "📋 *Ваши активные задания:*\n\n"
+    # Формируем ответ (только ссылки)
+    response = "📋 *Ваши активные задания:*\n\n"
     for chat_id, data in chats.items():
         response += f"*{data['title']}*:\n"
         for task_id, link, activity, author_name, msg_id in data['tasks']:
@@ -173,7 +175,7 @@ def my_tasks(message):
         bot.send_message(user_id, response, parse_mode='Markdown', disable_web_page_preview=True)
     except:
         bot.send_message(user_id, response.replace('*', ''), disable_web_page_preview=True)
-
+        
 # Обработчик кнопок
 @bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
 def done(call):
