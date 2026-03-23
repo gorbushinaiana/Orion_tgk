@@ -10,6 +10,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 bot = telebot.TeleBot(TOKEN)
 
+# Сбрасываем возможный старый вебхук или polling сессию
+try:
+    bot.remove_webhook()
+    print("Webhook removed (if any)")
+except:
+    pass
+
 conn = sqlite3.connect("db.db", check_same_thread=False)
 cursor = conn.cursor()
 db_lock = threading.Lock()
