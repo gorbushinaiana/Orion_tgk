@@ -160,12 +160,12 @@ def my_tasks(message):
             chats[chat_id] = {'title': chat_title, 'tasks': []}
         chats[chat_id]['tasks'].append((task_id, link, activity, author_name, msg_id))
 
-    response = "📋 *Ваши активные задания:*\n\n"
+     response = "📋 *Ваши активные задания:*\n\n"
     for chat_id, data in chats.items():
         response += f"*{data['title']}*:\n"
         for task_id, link, activity, author_name, msg_id in data['tasks']:
             msg_link = task_link(chat_id, msg_id) or link
-            response += f"• [{activity}]({msg_link}) — от @{author_name}\n"
+            response += f"• [Задание]({msg_link})\n"
         response += "\n"
     response += "Нажмите на ссылку, чтобы перейти к заданию, затем выполните его и нажмите кнопку ✅ Актив выполнен."
 
