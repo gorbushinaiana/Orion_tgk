@@ -5,19 +5,10 @@ import time
 import threading
 import datetime
 import os
-import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 bot = telebot.TeleBot(TOKEN)
-
-print("Проверяю соединение с Telegram API...")
-try:
-    me = bot.get_me()
-    print(f"✅ Бот подключён: @{me.username}")
-except Exception as e:
-    print(f"❌ Ошибка: {e}")
-    sys.exit(1)
 
 conn = sqlite3.connect("db.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -57,7 +48,9 @@ with db_lock:
     """)
     conn.commit()
 
-link_pattern = r"https://t.me/\S+"
+# Регулярное выражение для ссылок Telegram (с и без https)
+link_pattern = r"(?:https?://)?t\.me/\S+"
+
 MSK = datetime.timezone(datetime.timedelta(hours=3))
 
 def msk_now():
@@ -73,7 +66,7 @@ def is_work_time(post_time):
         return True
     elif weekday == 4:      # пятница
         return hour < 23
-    else:
+    else:                   # суббота, воскресенье
         return False
 
 def is_admin(chat_id, user_id):
@@ -115,34 +108,58 @@ def handle_message(message):
             (user_id, chat_id, username, now)
         )
         conn.commit()
-        return
+
+    # ---- Удаление сообщений в нерабочее время (выходные) ----
     if not is_work_time(message.date):
+        if not is_user_admin:
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except:
+                pass
         return
+
+    # ---- Поиск ссылки ----
+    match = re.search(link_pattern, message.text)
+    if not match:
+        if not is_user_admin:
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except:
+                pass
+        return
+
     link = match.group()
     activity = message.text.replace(link, "").strip() or "лайк"
-    now = int(time.time())
 
+    # ---- Лимит: 1 задание в сутки ----
+    now = int(time.time())
     with db_lock:
         cursor.execute(
             "SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?",
-            (message.from_user.id, chat_id, now - 86400)
+            (user_id, chat_id, now - 86400)
         )
-        if cursor.fetchone()[0] >= 2:
-            bot.send_message(chat_id, "❗ Лимит 2 задания в сутки")
+        if cursor.fetchone()[0] >= 1:
+            bot.send_message(chat_id, f"❗ @{username}, лимит 1 задание в сутки исчерпан. Задание не создано.")
+            if not is_user_admin:
+                try:
+                    bot.delete_message(chat_id, message.message_id)
+                except:
+                    pass
             return
 
+    # ---- Создаём задание ----
     with db_lock:
         cursor.execute(
             "INSERT INTO tasks (chat_id, author, author_name, link, activity, created) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, message.from_user.id, message.from_user.username, link, activity, now)
+            (chat_id, user_id, username, link, activity, now)
         )
         task_id = cursor.lastrowid
         conn.commit()
 
     sent = bot.send_message(
         chat_id,
-        f"📢 Новое задание\n\n@{message.from_user.username}\n{link}\n{activity}",
+        f"📢 Новое задание\n\n@{username}\n{link}\n{activity}",
         reply_markup=keyboard(task_id)
     )
 
@@ -150,7 +167,8 @@ def handle_message(message):
         cursor.execute("UPDATE tasks SET message_id=? WHERE id=?", (sent.message_id, task_id))
         conn.commit()
 
-    if not is_admin(chat_id, message.from_user.id):
+    # Удаляем исходное сообщение, если автор не админ
+    if not is_user_admin:
         try:
             bot.delete_message(chat_id, message.message_id)
         except:
@@ -166,17 +184,17 @@ def done(call):
         task = cursor.fetchone()
 
     if not task:
-        bot.answer_callback_query(call.id, "Задание не найдено")
+        bot.answer_callback_query(call.id)
         return
 
     created, chat_id, author_id = task
 
     if call.from_user.id == author_id:
-        bot.answer_callback_query(call.id, "⚠️ Нельзя выполнить своё задание")
+        bot.answer_callback_query(call.id)
         return
 
     if now - created < 10:
-        bot.answer_callback_query(call.id, "⚠️ Подождите 10 секунд")
+        bot.answer_callback_query(call.id)
         return
 
     with db_lock:
@@ -185,11 +203,10 @@ def done(call):
             (task_id, call.from_user.id, chat_id)
         )
         if cursor.fetchone():
-            bot.answer_callback_query(call.id, "Уже отмечено")
+            bot.answer_callback_query(call.id)
             return
 
-    bot.answer_callback_query(call.id, "Засчитано ✅")
-
+    # Засчитываем выполнение
     with db_lock:
         cursor.execute(
             "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) "
@@ -202,6 +219,9 @@ def done(call):
             (call.from_user.id, chat_id, call.from_user.username, now)
         )
         conn.commit()
+
+    # Тихо отвечаем на callback (без всплывающего уведомления)
+    bot.answer_callback_query(call.id)
 
 # ---------- Планировщик ----------
 def scheduler():
@@ -241,7 +261,7 @@ def scheduler():
                     pass
                 monday_notified.add(mon_key)
 
-            # Истекшие задания (5 минут)
+            # Истекшие задания (24 часа)
             with db_lock:
                 cursor.execute(
                     "SELECT id, created, author, author_name, message_id, link FROM tasks WHERE chat_id=?",
@@ -251,7 +271,7 @@ def scheduler():
 
             for task in tasks:
                 task_id, created, author_id, author_name, msg_id, link = task
-                if now - created > 86400:   # 24 часа
+                if now - created > 86400:
                     with db_lock:
                         cursor.execute(
                             "SELECT username FROM completions WHERE task_id=? AND chat_id=?",
@@ -264,7 +284,6 @@ def scheduler():
                         )
                         all_users = {x[0] for x in cursor.fetchall()}
 
-                    # Исключаем автора и админов
                     admins = set()
                     for u in all_users:
                         with db_lock:
@@ -330,7 +349,7 @@ def scheduler():
 
         time.sleep(60)
 
-# ---------- Health-сервер ----------
+# ---------- Health-сервер для Railway ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -348,4 +367,4 @@ threading.Thread(target=run_health_server, daemon=True).start()
 threading.Thread(target=scheduler, daemon=True).start()
 
 print("Бот запущен...")
-bot.infinity_polling()
+bot.infinity_polling(timeout=30, long_polling_timeout=30)
