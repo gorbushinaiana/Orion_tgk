@@ -10,7 +10,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 bot = telebot.TeleBot(TOKEN)
-bot.infinity_polling(timeout=30, long_polling_timeout=30)
 
 print("Проверяю соединение с Telegram API...")
 try:
