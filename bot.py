@@ -272,8 +272,8 @@ def handle_message(message):
                 "SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?",
                 (user_id, chat_id, now - 86400)
             )
-            if cursor.fetchone()[0] >= 1:
-                bot.send_message(chat_id, f"❗ @{username}, лимит 1 задание в сутки исчерпан. Задание не создано.")
+            if cursor.fetchone()[0] >= 2:
+                bot.send_message(chat_id, f"❗ @{username}, лимит 2 задания в сутки исчерпан. Задание не создано.")
                 try:
                     bot.delete_message(chat_id, message.message_id)
                 except:
