@@ -7,38 +7,34 @@ import datetime
 import os
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import defaultdict
+import logging
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 bot = telebot.TeleBot(TOKEN)
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    if message.chat.type == "private":
-        bot.send_message(
-            message.chat.id,
-            "👋 Привет! Я бот для взаимной активности.\n\n"
-            "📌 Правила:\n"
-            "• Отправляй ссылки на посты в чат – я создам задание.\n"
-            "• Выполнив задание, нажми кнопку под ним.\n"
-            "• Чтобы узнать свои невыполненные задания, напиши /my_tasks в личку.\n\n"
-            "Если есть вопросы – пиши администратору."
-        )
-# --- Принудительный сброс webhook и pending updates через прямой запрос ---
+# --- Принудительный сброс webhook и pending updates ---
 def reset_telegram_webhook(token):
     try:
-        # Сброс webhook
         resp = requests.post(f"https://api.telegram.org/bot{token}/deleteWebhook", json={"drop_pending_updates": True})
         if resp.status_code == 200:
-            print("Webhook reset successfully (drop_pending_updates=True)")
+            logger.info("Webhook reset successfully (drop_pending_updates=True)")
         else:
-            print(f"Webhook reset failed: {resp.text}")
+            logger.error(f"Webhook reset failed: {resp.text}")
     except Exception as e:
-        print(f"Error resetting webhook: {e}")
+        logger.error(f"Error resetting webhook: {e}")
 
 reset_telegram_webhook(TOKEN)
 time.sleep(2)  # Даем время Telegram'у обработать
 
-# Остальной код
+# --- База данных ---
 conn = sqlite3.connect("db.db", check_same_thread=False)
 cursor = conn.cursor()
 db_lock = threading.Lock()
@@ -75,6 +71,10 @@ with db_lock:
             verified INTEGER DEFAULT 0
         )
     """)
+    # Индексы для ускорения запросов
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_completions_task_user ON completions(task_id, user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_completions_chat ON completions(chat_id)")
     conn.commit()
 
 link_pattern = r"(?:https?://)?t\.me/\S+"
@@ -87,13 +87,13 @@ def is_work_time(post_time):
     dt = datetime.datetime.fromtimestamp(post_time, tz=MSK)
     weekday = dt.weekday()
     hour = dt.hour
-    if weekday == 0:
+    if weekday == 0:  # понедельник
         return hour >= 7
-    elif 1 <= weekday <= 3:
+    elif 1 <= weekday <= 3:  # вторник-четверг
         return True
-    elif weekday == 4:
+    elif weekday == 4:  # пятница
         return hour < 23
-    else:
+    else:  # суббота, воскресенье
         return False
 
 def is_admin(chat_id, user_id):
@@ -105,7 +105,8 @@ def is_admin(chat_id, user_id):
     try:
         status = bot.get_chat_member(chat_id, user_id).status
         return status in ["administrator", "creator"]
-    except:
+    except Exception as e:
+        logger.warning(f"Failed to check admin status for user {user_id} in chat {chat_id}: {e}")
         return False
 
 def task_link(chat_id, message_id):
@@ -121,7 +122,7 @@ def keyboard(task_id):
     ))
     return markup
 
-# Обработчик команды my_tasks
+# --- Обработчик команды /my_tasks ---
 @bot.message_handler(commands=['my_tasks'])
 def my_tasks(message):
     if message.chat.type != "private":
@@ -154,38 +155,45 @@ def my_tasks(message):
         chat_id = task[0]
         try:
             member = bot.get_chat_member(chat_id, user_id)
-            # Пользователь не должен быть вышедшим или удалённым
             if member.status in ["left", "kicked"]:
                 continue
-            # Если не хотим показывать задания администраторам (даже если они не создавали)
             if member.status in ["administrator", "creator"]:
                 continue
             filtered.append(task)
         except Exception as e:
-            # Если пользователь не в чате или бот не может получить информацию, пропускаем
+            logger.warning(f"Failed to get member for {user_id} in {chat_id}: {e}")
             continue
 
     if not filtered:
         bot.send_message(user_id, "✅ У вас нет активных невыполненных заданий.")
         return
 
-    # Далее формирование ответа (без изменений)
-    # Формируем ответ (только ссылки)
+    # Группировка заданий по чатам
+    tasks_by_chat = defaultdict(list)
+    for chat_id, task_id, link, activity, author_name, msg_id in filtered:
+        tasks_by_chat[chat_id].append((task_id, link, activity, author_name, msg_id))
+
+    # Формируем ответ
     response = "📋 *Ваши активные задания:*\n\n"
-    for chat_id, data in chats.items():
-        response += f"*{data['title']}*:\n"
-        for task_id, link, activity, author_name, msg_id in data['tasks']:
+    for chat_id, tasks in tasks_by_chat.items():
+        # Получаем название чата (можно через bot.get_chat, но для производительности показываем ID)
+        chat_info = bot.get_chat(chat_id) if chat_id < 0 else None
+        chat_title = chat_info.title if chat_info else f"Чат {chat_id}"
+        response += f"*{chat_title}*:\n"
+        for task_id, link, activity, author_name, msg_id in tasks:
             msg_link = task_link(chat_id, msg_id) or link
             response += f"• [Задание]({msg_link})\n"
         response += "\n"
     response += "Нажмите на ссылку, чтобы перейти к заданию, затем выполните его и нажмите кнопку ✅ Актив выполнен."
 
+    # Отправка с возможным fallback на обычный текст, если Markdown не проходит
     try:
         bot.send_message(user_id, response, parse_mode='Markdown', disable_web_page_preview=True)
-    except:
+    except Exception as e:
+        logger.warning(f"Markdown failed for /my_tasks: {e}")
         bot.send_message(user_id, response.replace('*', ''), disable_web_page_preview=True)
-        
-# Обработчик кнопок
+
+# --- Обработчик кнопок ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
 def done(call):
     task_id = int(call.data.split("_")[1])
@@ -230,9 +238,9 @@ def done(call):
         )
         conn.commit()
 
-    bot.answer_callback_query(call.id)
+    bot.answer_callback_query(call.id, "Задание выполнено!")
 
-# Обработчик всех остальных сообщений
+# --- Обработчик всех остальных сообщений ---
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     if message.chat.type == "private":
@@ -259,8 +267,8 @@ def handle_message(message):
         if not is_user_admin:
             try:
                 bot.delete_message(chat_id, message.message_id)
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to delete message in chat {chat_id}: {e}")
         return
 
     match = re.search(link_pattern, message.text)
@@ -268,8 +276,8 @@ def handle_message(message):
         if not is_user_admin:
             try:
                 bot.delete_message(chat_id, message.message_id)
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to delete message in chat {chat_id}: {e}")
         return
 
     link = match.group()
@@ -285,8 +293,8 @@ def handle_message(message):
                 bot.send_message(chat_id, f"❗ @{username}, лимит 2 задания в сутки исчерпан. Задание не создано.")
                 try:
                     bot.delete_message(chat_id, message.message_id)
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to delete message in chat {chat_id}: {e}")
                 return
 
     with db_lock:
@@ -311,14 +319,15 @@ def handle_message(message):
     if not is_user_admin:
         try:
             bot.delete_message(chat_id, message.message_id)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to delete message in chat {chat_id}: {e}")
 
-# ---------- Планировщик ----------
+# --- Планировщик (с исправленной логикой отчётов) ---
 def scheduler():
-    weekly_reported = set()
-    friday_notified = set()
-    monday_notified = set()
+    # Переменные для хранения номера недели последнего отправленного уведомления
+    friday_notified_week = None
+    monday_notified_week = None
+    weekly_reported_week = None
 
     while True:
         now = int(time.time())
@@ -327,6 +336,7 @@ def scheduler():
         hour = now_dt.hour
         week_num = now_dt.isocalendar()[1]
 
+        # Получаем список всех чатов, где есть активность
         with db_lock:
             cursor.execute("SELECT DISTINCT chat_id FROM users")
             chats = {r[0] for r in cursor.fetchall()}
@@ -334,20 +344,23 @@ def scheduler():
             chats |= {r[0] for r in cursor.fetchall()}
 
         for chat_id in chats:
-            if day == 4 and hour == 23 and (chat_id, week_num) not in friday_notified:
+            # Пятничное напоминание (23:00)
+            if day == 4 and hour == 23 and friday_notified_week != week_num:
                 try:
                     bot.send_message(chat_id, "🌙 Пост-чат ушел на выходные! Актив по желанию")
-                except:
-                    pass
-                friday_notified.add((chat_id, week_num))
+                except Exception as e:
+                    logger.error(f"Failed to send friday message in {chat_id}: {e}")
+                friday_notified_week = week_num
 
-            if day == 0 and hour == 7 and (chat_id, week_num) not in monday_notified:
+            # Понедельничное приветствие (7:00)
+            if day == 0 and hour == 7 and monday_notified_week != week_num:
                 try:
                     bot.send_message(chat_id, "☀️ Доброе утро, пост-чат работает в нормальном режиме")
-                except:
-                    pass
-                monday_notified.add((chat_id, week_num))
+                except Exception as e:
+                    logger.error(f"Failed to send monday message in {chat_id}: {e}")
+                monday_notified_week = week_num
 
+            # Обработка истекших заданий (старше 24 часов)
             with db_lock:
                 cursor.execute(
                     "SELECT id, created, author, author_name, message_id, link FROM tasks WHERE chat_id=?",
@@ -358,82 +371,118 @@ def scheduler():
             for task in tasks:
                 task_id, created, author_id, author_name, msg_id, link = task
                 if now - created > 86400:
+                    # Собираем пользователей, выполнивших задание
                     with db_lock:
                         cursor.execute(
                             "SELECT username FROM completions WHERE task_id=? AND chat_id=?",
                             (task_id, chat_id)
                         )
-                        done_users = {x[0] for x in cursor.fetchall()}
+                        done_users = {row[0] for row in cursor.fetchall()}
+                        # Получаем всех участников чата из таблицы users
                         cursor.execute(
-                            "SELECT username FROM users WHERE chat_id=?",
+                            "SELECT username, id FROM users WHERE chat_id=?",
                             (chat_id,)
                         )
-                        all_users = {x[0] for x in cursor.fetchall()}
+                        all_users = {row[0]: row[1] for row in cursor.fetchall()}
 
+                    # Определяем администраторов чата
                     admins = set()
-                    for u in all_users:
-                        with db_lock:
-                            cursor.execute("SELECT id FROM users WHERE username=? AND chat_id=?", (u, chat_id))
-                            row = cursor.fetchone()
-                        if row and is_admin(chat_id, row[0]):
-                            admins.add(u)
+                    for uname, uid in all_users.items():
+                        if is_admin(chat_id, uid):
+                            admins.add(uname)
 
-                    not_done = (all_users - done_users) - {author_name} - admins
+                    # Кто не выполнил (все, кто не в done, не автор и не админ)
+                    not_done = []
+                    for uname, uid in all_users.items():
+                        if uname not in done_users and uname != author_name and uname not in admins:
+                            if uname:
+                                not_done.append(f"@{uname}")
+                            else:
+                                # Если нет username, используем ID
+                                not_done.append(f"id{uid}")
 
                     link_msg = task_link(chat_id, msg_id) or link
+
+                    # Отправляем отчёт с разбивкой на части, если список невыполнивших слишком длинный
                     if not_done:
-                        text = "❌ Не выполнили задание"
-                        if link_msg:
-                            text += f" ({link_msg})"
-                        text += ":\n\n" + "\n".join([f"@{u}" for u in not_done if u])
+                        # Разбиваем список на части по 100 элементов (чтобы не превышать лимит символов)
+                        chunk_size = 100
+                        for i in range(0, len(not_done), chunk_size):
+                            chunk = not_done[i:i+chunk_size]
+                            text = "❌ Не выполнили задание"
+                            if link_msg:
+                                text += f" ({link_msg})"
+                            text += ":\n\n" + "\n".join(chunk)
+                            try:
+                                bot.send_message(chat_id, text)
+                            except Exception as e:
+                                logger.error(f"Failed to send expiration report for task {task_id}: {e}")
                     else:
                         text = "✅ Все выполнили задание"
                         if link_msg:
                             text += f" ({link_msg})"
+                        try:
+                            bot.send_message(chat_id, text)
+                        except Exception as e:
+                            logger.error(f"Failed to send expiration report for task {task_id}: {e}")
 
-                    try:
-                        bot.send_message(chat_id, text)
-                    except Exception as e:
-                        print(f"Ошибка отправки отчёта: {e}")
-
+                    # Удаляем задание
                     with db_lock:
                         cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                         conn.commit()
 
-            if day == 6 and hour == 12 and (chat_id, week_num) not in weekly_reported:
+            # Недельный отчёт (суббота, 12:00)
+            if day == 5 and hour == 12 and weekly_reported_week != week_num:
                 week_ago = now - 604800
                 with db_lock:
+                    # Неактивные пользователи (не заходили более недели)
                     cursor.execute(
                         "SELECT username FROM users WHERE chat_id=? AND last_active<?",
                         (chat_id, week_ago)
                     )
-                    inactive = [f"@{x[0]}" for x in cursor.fetchall() if x[0]]
-                    cursor.execute(
-                        "SELECT username, COUNT(*) as c FROM completions WHERE chat_id=? "
-                        "GROUP BY user_id ORDER BY c DESC LIMIT 5",
-                        (chat_id,)
-                    )
+                    inactive = [f"@{row[0]}" for row in cursor.fetchall() if row[0]]
+
+                    # Топ-5 по выполнениям
+                    cursor.execute("""
+                        SELECT username, COUNT(*) as c 
+                        FROM completions 
+                        WHERE chat_id=? 
+                        GROUP BY user_id 
+                        ORDER BY c DESC 
+                        LIMIT 5
+                    """, (chat_id,))
                     top = cursor.fetchall()
 
                 text = "📊 **Недельный отчёт**\n\n"
                 if inactive:
-                    text += "❌ Неактивные:\n" + "\n".join(inactive) + "\n\n"
+                    # Разбиваем список неактивных на части, если их много
+                    if len(inactive) > 50:
+                        text += "❌ Неактивные (список большой, показываю первых 50):\n" + "\n".join(inactive[:50])
+                    else:
+                        text += "❌ Неактивные:\n" + "\n".join(inactive)
+                    text += "\n\n"
                 else:
                     text += "✅ Все активны!\n\n"
                 if top:
                     text += "🏆 **Топ по выполнениям:**\n"
-                    for t in top:
-                        text += f"@{t[0]} — {t[1]}\n"
+                    for username, count in top:
+                        text += f"@{username} — {count}\n"
 
+                # Отправляем отчёт (если текст слишком длинный, отправим как обычный текст без Markdown)
                 try:
                     bot.send_message(chat_id, text, parse_mode="Markdown")
-                except:
-                    pass
-                weekly_reported.add((chat_id, week_num))
+                except Exception as e:
+                    logger.warning(f"Markdown failed for weekly report in chat {chat_id}: {e}")
+                    try:
+                        bot.send_message(chat_id, text.replace('*', ''))
+                    except Exception as e2:
+                        logger.error(f"Failed to send weekly report in chat {chat_id}: {e2}")
+
+                weekly_reported_week = week_num
 
         time.sleep(60)
 
-# ---------- Health-сервер ----------
+# --- Health-сервер ---
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -450,5 +499,5 @@ def run_health_server():
 threading.Thread(target=run_health_server, daemon=True).start()
 threading.Thread(target=scheduler, daemon=True).start()
 
-print("Бот запущен...")
+logger.info("Бот запущен...")
 bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
