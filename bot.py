@@ -83,27 +83,31 @@ def is_work_time(post_time):
     dt = datetime.datetime.fromtimestamp(post_time, tz=MSK)
     weekday = dt.weekday()
     hour = dt.hour
-    if weekday == 0:
+    if weekday == 0:          # понедельник
         return hour >= 7
-    elif 1 <= weekday <= 3:
+    elif 1 <= weekday <= 3:   # вторник-четверг
         return True
-    elif weekday == 4:
+    elif weekday == 4:        # пятница
         return hour < 23
-    else:
+    else:                     # суббота, воскресенье
         return False
 
 def is_admin(chat_id, user_id):
+    # Проверка глобальных администраторов из переменной окружения
     admin_ids = os.environ.get("ADMIN_IDS", "")
     if admin_ids:
         admin_list = [int(x.strip()) for x in admin_ids.split(",") if x.strip().isdigit()]
         if user_id in admin_list:
             return True
-    try:
-        status = bot.get_chat_member(chat_id, user_id).status
-        return status in ["administrator", "creator"]
-    except Exception as e:
-        logger.warning(f"Failed to check admin status for user {user_id} in chat {chat_id}: {e}")
-        return False
+
+    # Если передан конкретный чат, проверяем статус в нём
+    if chat_id is not None:
+        try:
+            status = bot.get_chat_member(chat_id, user_id).status
+            return status in ["administrator", "creator"]
+        except Exception as e:
+            logger.warning(f"Failed to check admin status for user {user_id} in chat {chat_id}: {e}")
+    return False
 
 def task_link(chat_id, message_id):
     if message_id and chat_id < 0:
@@ -138,14 +142,49 @@ def stats(message):
         cursor.execute("SELECT COUNT(*) FROM users")
         total_users = cursor.fetchone()[0]
 
-    text = f"📊 Статистика бота:\n\n" \
-           f"Активных заданий (последние 24ч): {active_tasks}\n" \
-           f"Выполнено за сутки: {completions_today}\n" \
-           f"Всего заданий: {total_tasks}\n" \
-           f"Всего пользователей: {total_users}"
+    text = (f"📊 Статистика бота:\n\n"
+            f"Активных заданий (последние 24ч): {active_tasks}\n"
+            f"Выполнено за сутки: {completions_today}\n"
+            f"Всего заданий: {total_tasks}\n"
+            f"Всего пользователей: {total_users}")
     bot.send_message(user_id, text)
 
-# --- Команда /force_report (администраторы) для принудительного отчёта по всем истекшим заданиям ---
+# --- Команда /debug_tasks (администраторы) ---
+@bot.message_handler(commands=['debug_tasks'])
+def debug_tasks(message):
+    if message.chat.type != "private":
+        return
+    user_id = message.from_user.id
+    if not is_admin(None, user_id):
+        bot.send_message(user_id, "У вас нет прав.")
+        return
+
+    with db_lock:
+        cursor.execute("""
+            SELECT id, chat_id, author_name, link, created, message_id
+            FROM tasks
+            ORDER BY created DESC
+        """)
+        tasks = cursor.fetchall()
+
+    if not tasks:
+        bot.send_message(user_id, "Нет заданий в базе.")
+        return
+
+    now = int(time.time())
+    text = "📋 *Все задания в базе:*\n\n"
+    for task in tasks:
+        task_id, chat_id, author, link, created, msg_id = task
+        age_hours = (now - created) / 3600
+        status = "✅ истекло" if now - created > 86400 else f"⏳ {age_hours:.1f} ч"
+        text += f"ID {task_id}: чат {chat_id}, автор @{author}, {status}\n"
+        text += f"   ссылка: {link}\n"
+    try:
+        bot.send_message(user_id, text, parse_mode='Markdown', disable_web_page_preview=True)
+    except Exception as e:
+        bot.send_message(user_id, text.replace('*', ''), disable_web_page_preview=True)
+
+# --- Команда /force_report (администраторы) ---
 @bot.message_handler(commands=['force_report'])
 def force_report(message):
     if message.chat.type != "private":
@@ -165,6 +204,7 @@ def force_report(message):
         bot.send_message(user_id, "Нет заданий.")
         return
 
+    processed = 0
     for task in tasks:
         task_id, chat_id, author_id, author_name, msg_id, link, created = task
         if now - created > 86400:
@@ -172,7 +212,8 @@ def force_report(message):
             with db_lock:
                 cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                 conn.commit()
-    bot.send_message(user_id, "Отчёты отправлены.")
+            processed += 1
+    bot.send_message(user_id, f"Отчёты отправлены для {processed} заданий.")
 
 def process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link):
     logger.info(f"Processing expired task {task_id} in chat {chat_id}")
@@ -182,6 +223,7 @@ def process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
         cursor.execute("SELECT username, id FROM users WHERE chat_id=?", (chat_id,))
         all_users = {row[0]: row[1] for row in cursor.fetchall()}
 
+    # Определяем администраторов чата
     admins = set()
     for uname, uid in all_users.items():
         if is_admin(chat_id, uid):
@@ -418,7 +460,7 @@ def handle_message(message):
         except Exception as e:
             logger.warning(f"Failed to delete message in chat {chat_id}: {e}")
 
-# --- Планировщик с логированием ---
+# --- Планировщик ---
 def scheduler():
     logger.info("Scheduler started")
     friday_notified_week = None
@@ -432,7 +474,7 @@ def scheduler():
         hour = now_dt.hour
         week_num = now_dt.isocalendar()[1]
         tick += 1
-        if tick % 10 == 0:  # раз в 10 минут
+        if tick % 10 == 0:   # раз в 10 минут пишем в лог
             logger.info(f"Scheduler tick #{tick}, day={day}, hour={hour}")
 
         with db_lock:
@@ -442,7 +484,7 @@ def scheduler():
             chats |= {r[0] for r in cursor.fetchall()}
 
         for chat_id in chats:
-            # Пятничное напоминание
+            # Пятничное напоминание (23:00)
             if day == 4 and hour == 23 and friday_notified_week != week_num:
                 try:
                     bot.send_message(chat_id, "🌙 Пост-чат ушел на выходные! Актив по желанию")
@@ -451,7 +493,7 @@ def scheduler():
                     logger.error(f"Failed to send friday message in {chat_id}: {e}")
                 friday_notified_week = week_num
 
-            # Понедельничное приветствие
+            # Понедельничное приветствие (7:00)
             if day == 0 and hour == 7 and monday_notified_week != week_num:
                 try:
                     bot.send_message(chat_id, "☀️ Доброе утро, пост-чат работает в нормальном режиме")
@@ -474,14 +516,14 @@ def scheduler():
                         cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                         conn.commit()
 
-            # Недельный отчёт (суббота 12:00)
+            # Недельный отчёт (суббота, 12:00)
             if day == 5 and hour == 12 and weekly_reported_week != week_num:
                 week_ago = now - 604800
                 with db_lock:
                     cursor.execute("SELECT username FROM users WHERE chat_id=? AND last_active<?", (chat_id, week_ago))
                     inactive = [f"@{row[0]}" for row in cursor.fetchall() if row[0]]
                     cursor.execute("""
-                        SELECT username, COUNT(*) as c FROM completions 
+                        SELECT username, COUNT(*) as c FROM completions
                         WHERE chat_id=? GROUP BY user_id ORDER BY c DESC LIMIT 5
                     """, (chat_id,))
                     top = cursor.fetchall()
