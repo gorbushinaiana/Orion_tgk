@@ -31,9 +31,6 @@ def reset_telegram_webhook(token):
     except Exception as e:
         logger.error(f"Error resetting webhook: {e}")
 
-reset_telegram_webhook(TOKEN)
-time.sleep(2)  # Даем время Telegram'у обработать
-
 # --- База данных ---
 conn = sqlite3.connect("db.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -71,7 +68,7 @@ with db_lock:
             verified INTEGER DEFAULT 0
         )
     """)
-    # Индексы для ускорения запросов
+    # Индексы
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_completions_task_user ON completions(task_id, user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_completions_chat ON completions(chat_id)")
@@ -121,6 +118,33 @@ def keyboard(task_id):
         "✅ Актив выполнен", callback_data=f"done_{task_id}"
     ))
     return markup
+
+# --- Команда /stats (только для администраторов) ---
+@bot.message_handler(commands=['stats'])
+def stats(message):
+    if message.chat.type != "private":
+        return
+    user_id = message.from_user.id
+    if not is_admin(None, user_id):  # None означает, что проверяем глобальных админов
+        bot.send_message(user_id, "У вас нет прав.")
+        return
+
+    with db_lock:
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE created > ?", (int(time.time()) - 86400,))
+        active_tasks = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM completions WHERE time > ?", (int(time.time()) - 86400,))
+        completions_today = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM tasks")
+        total_tasks = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+
+    text = f"📊 Статистика бота:\n\n" \
+           f"Активных заданий (последние 24ч): {active_tasks}\n" \
+           f"Выполнено за сутки: {completions_today}\n" \
+           f"Всего заданий: {total_tasks}\n" \
+           f"Всего пользователей: {total_users}"
+    bot.send_message(user_id, text)
 
 # --- Обработчик команды /my_tasks ---
 @bot.message_handler(commands=['my_tasks'])
@@ -173,12 +197,13 @@ def my_tasks(message):
     for chat_id, task_id, link, activity, author_name, msg_id in filtered:
         tasks_by_chat[chat_id].append((task_id, link, activity, author_name, msg_id))
 
-    # Формируем ответ
     response = "📋 *Ваши активные задания:*\n\n"
     for chat_id, tasks in tasks_by_chat.items():
-        # Получаем название чата (можно через bot.get_chat, но для производительности показываем ID)
-        chat_info = bot.get_chat(chat_id) if chat_id < 0 else None
-        chat_title = chat_info.title if chat_info else f"Чат {chat_id}"
+        try:
+            chat_info = bot.get_chat(chat_id)
+            chat_title = chat_info.title if chat_info else f"Чат {chat_id}"
+        except:
+            chat_title = f"Чат {chat_id}"
         response += f"*{chat_title}*:\n"
         for task_id, link, activity, author_name, msg_id in tasks:
             msg_link = task_link(chat_id, msg_id) or link
@@ -186,7 +211,6 @@ def my_tasks(message):
         response += "\n"
     response += "Нажмите на ссылку, чтобы перейти к заданию, затем выполните его и нажмите кнопку ✅ Актив выполнен."
 
-    # Отправка с возможным fallback на обычный текст, если Markdown не проходит
     try:
         bot.send_message(user_id, response, parse_mode='Markdown', disable_web_page_preview=True)
     except Exception as e:
@@ -322,9 +346,8 @@ def handle_message(message):
         except Exception as e:
             logger.warning(f"Failed to delete message in chat {chat_id}: {e}")
 
-# --- Планировщик (с исправленной логикой отчётов) ---
+# --- Планировщик (с исправленной логикой отчётов и логированием) ---
 def scheduler():
-    # Переменные для хранения номера недели последнего отправленного уведомления
     friday_notified_week = None
     monday_notified_week = None
     weekly_reported_week = None
@@ -348,6 +371,7 @@ def scheduler():
             if day == 4 and hour == 23 and friday_notified_week != week_num:
                 try:
                     bot.send_message(chat_id, "🌙 Пост-чат ушел на выходные! Актив по желанию")
+                    logger.info(f"Sent friday message to chat {chat_id}")
                 except Exception as e:
                     logger.error(f"Failed to send friday message in {chat_id}: {e}")
                 friday_notified_week = week_num
@@ -356,6 +380,7 @@ def scheduler():
             if day == 0 and hour == 7 and monday_notified_week != week_num:
                 try:
                     bot.send_message(chat_id, "☀️ Доброе утро, пост-чат работает в нормальном режиме")
+                    logger.info(f"Sent monday message to chat {chat_id}")
                 except Exception as e:
                     logger.error(f"Failed to send monday message in {chat_id}: {e}")
                 monday_notified_week = week_num
@@ -371,14 +396,14 @@ def scheduler():
             for task in tasks:
                 task_id, created, author_id, author_name, msg_id, link = task
                 if now - created > 86400:
-                    # Собираем пользователей, выполнивших задание
+                    logger.info(f"Task {task_id} expired in chat {chat_id}, sending report")
+                    # Собираем выполнивших
                     with db_lock:
                         cursor.execute(
                             "SELECT username FROM completions WHERE task_id=? AND chat_id=?",
                             (task_id, chat_id)
                         )
                         done_users = {row[0] for row in cursor.fetchall()}
-                        # Получаем всех участников чата из таблицы users
                         cursor.execute(
                             "SELECT username, id FROM users WHERE chat_id=?",
                             (chat_id,)
@@ -391,21 +416,18 @@ def scheduler():
                         if is_admin(chat_id, uid):
                             admins.add(uname)
 
-                    # Кто не выполнил (все, кто не в done, не автор и не админ)
                     not_done = []
                     for uname, uid in all_users.items():
                         if uname not in done_users and uname != author_name and uname not in admins:
                             if uname:
                                 not_done.append(f"@{uname}")
                             else:
-                                # Если нет username, используем ID
                                 not_done.append(f"id{uid}")
 
                     link_msg = task_link(chat_id, msg_id) or link
 
-                    # Отправляем отчёт с разбивкой на части, если список невыполнивших слишком длинный
+                    # Отправляем отчёт с разбивкой на части
                     if not_done:
-                        # Разбиваем список на части по 100 элементов (чтобы не превышать лимит символов)
                         chunk_size = 100
                         for i in range(0, len(not_done), chunk_size):
                             chunk = not_done[i:i+chunk_size]
@@ -415,6 +437,7 @@ def scheduler():
                             text += ":\n\n" + "\n".join(chunk)
                             try:
                                 bot.send_message(chat_id, text)
+                                logger.info(f"Sent expiration report for task {task_id} to chat {chat_id} (chunk {i//chunk_size+1})")
                             except Exception as e:
                                 logger.error(f"Failed to send expiration report for task {task_id}: {e}")
                     else:
@@ -423,8 +446,9 @@ def scheduler():
                             text += f" ({link_msg})"
                         try:
                             bot.send_message(chat_id, text)
+                            logger.info(f"Sent completion report for task {task_id} to chat {chat_id}")
                         except Exception as e:
-                            logger.error(f"Failed to send expiration report for task {task_id}: {e}")
+                            logger.error(f"Failed to send completion report for task {task_id}: {e}")
 
                     # Удаляем задание
                     with db_lock:
@@ -435,14 +459,11 @@ def scheduler():
             if day == 5 and hour == 12 and weekly_reported_week != week_num:
                 week_ago = now - 604800
                 with db_lock:
-                    # Неактивные пользователи (не заходили более недели)
                     cursor.execute(
                         "SELECT username FROM users WHERE chat_id=? AND last_active<?",
                         (chat_id, week_ago)
                     )
                     inactive = [f"@{row[0]}" for row in cursor.fetchall() if row[0]]
-
-                    # Топ-5 по выполнениям
                     cursor.execute("""
                         SELECT username, COUNT(*) as c 
                         FROM completions 
@@ -455,7 +476,6 @@ def scheduler():
 
                 text = "📊 **Недельный отчёт**\n\n"
                 if inactive:
-                    # Разбиваем список неактивных на части, если их много
                     if len(inactive) > 50:
                         text += "❌ Неактивные (список большой, показываю первых 50):\n" + "\n".join(inactive[:50])
                     else:
@@ -468,9 +488,9 @@ def scheduler():
                     for username, count in top:
                         text += f"@{username} — {count}\n"
 
-                # Отправляем отчёт (если текст слишком длинный, отправим как обычный текст без Markdown)
                 try:
                     bot.send_message(chat_id, text, parse_mode="Markdown")
+                    logger.info(f"Sent weekly report to chat {chat_id}")
                 except Exception as e:
                     logger.warning(f"Markdown failed for weekly report in chat {chat_id}: {e}")
                     try:
@@ -482,7 +502,7 @@ def scheduler():
 
         time.sleep(60)
 
-# ---------- Health-сервер ----------
+# --- Health-сервер ---
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -500,12 +520,9 @@ threading.Thread(target=run_health_server, daemon=True).start()
 threading.Thread(target=scheduler, daemon=True).start()
 
 if __name__ == "__main__":
-    # Сброс вебхука перед первым запуском
     reset_telegram_webhook(TOKEN)
-    time.sleep(5)  # Даём время Telegram'у обработать сброс
+    time.sleep(5)
     logger.info("Бот запущен...")
-    
-    # Цикл для устойчивости к ошибкам 409
     while True:
         try:
             bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
