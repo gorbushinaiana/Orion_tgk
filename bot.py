@@ -482,7 +482,7 @@ def scheduler():
 
         time.sleep(60)
 
-# --- Health-сервер ---
+# ---------- Health-сервер ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -499,5 +499,24 @@ def run_health_server():
 threading.Thread(target=run_health_server, daemon=True).start()
 threading.Thread(target=scheduler, daemon=True).start()
 
-logger.info("Бот запущен...")
-bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
+if __name__ == "__main__":
+    # Сброс вебхука перед первым запуском
+    reset_telegram_webhook(TOKEN)
+    time.sleep(5)  # Даём время Telegram'у обработать сброс
+    logger.info("Бот запущен...")
+    
+    # Цикл для устойчивости к ошибкам 409
+    while True:
+        try:
+            bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
+        except telebot.apihelper.ApiTelegramException as e:
+            logger.error(f"Polling error: {e}")
+            if "409" in str(e):
+                logger.warning("Conflict detected (409). Resetting webhook and retrying...")
+                reset_telegram_webhook(TOKEN)
+                time.sleep(10)
+            else:
+                time.sleep(30)
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            time.sleep(30)
