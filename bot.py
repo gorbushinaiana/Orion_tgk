@@ -20,8 +20,12 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 bot = telebot.TeleBot(TOKEN)
 
-# Время жизни задания в секундах (12 часов)
-TASK_LIFETIME = 12 * 3600
+# Время жизни задания (24 часа)
+TASK_LIFETIME = 24 * 3600
+# Период для лимита создания заданий (12 часов)
+USER_TASK_LIMIT_PERIOD = 12 * 3600
+# Максимум заданий за период для обычных пользователей
+MAX_TASKS_PER_USER = 2
 
 # --- Принудительный сброс webhook и pending updates ---
 def reset_telegram_webhook(token):
@@ -138,8 +142,8 @@ def stats(message):
     with db_lock:
         cursor.execute("SELECT COUNT(*) FROM tasks WHERE created > ?", (int(time.time()) - TASK_LIFETIME,))
         active_tasks = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM completions WHERE time > ?", (int(time.time()) - TASK_LIFETIME,))
-        completions_today = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM completions WHERE time > ?", (int(time.time()) - USER_TASK_LIMIT_PERIOD,))
+        completions_last_period = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM tasks")
         total_tasks = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM users")
@@ -147,7 +151,7 @@ def stats(message):
 
     text = (f"📊 Статистика бота:\n\n"
             f"Активных заданий (последние {TASK_LIFETIME//3600} ч): {active_tasks}\n"
-            f"Выполнено за {TASK_LIFETIME//3600} ч: {completions_today}\n"
+            f"Выполнено за последние {USER_TASK_LIMIT_PERIOD//3600} ч: {completions_last_period}\n"
             f"Всего заданий: {total_tasks}\n"
             f"Всего пользователей: {total_users}")
     bot.send_message(user_id, text)
@@ -428,10 +432,10 @@ def handle_message(message):
         with db_lock:
             cursor.execute(
                 "SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?",
-                (user_id, chat_id, now - TASK_LIFETIME)
+                (user_id, chat_id, now - USER_TASK_LIMIT_PERIOD)
             )
-            if cursor.fetchone()[0] >= 2:
-                bot.send_message(chat_id, f"❗ @{username}, лимит 2 задания в сутки исчерпан. Задание не создано.")
+            if cursor.fetchone()[0] >= MAX_TASKS_PER_USER:
+                bot.send_message(chat_id, f"❗ @{username}, лимит {MAX_TASKS_PER_USER} задания за {USER_TASK_LIMIT_PERIOD//3600} часов исчерпан. Задание не создано.")
                 try:
                     bot.delete_message(chat_id, message.message_id)
                 except Exception as e:
@@ -505,7 +509,7 @@ def scheduler():
                     logger.error(f"Failed to send monday message in {chat_id}: {e}")
                 monday_notified_week = week_num
 
-            # Обработка истекших заданий
+            # Обработка истекших заданий (24 часа)
             with db_lock:
                 cursor.execute("SELECT id, created, author, author_name, message_id, link FROM tasks WHERE chat_id=?", (chat_id,))
                 tasks = cursor.fetchall()
