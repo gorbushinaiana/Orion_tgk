@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 bot = telebot.TeleBot(TOKEN)
 
+# Время жизни задания в секундах (12 часов)
+TASK_LIFETIME = 12 * 3600
+
 # --- Принудительный сброс webhook и pending updates ---
 def reset_telegram_webhook(token):
     try:
@@ -133,9 +136,9 @@ def stats(message):
         return
 
     with db_lock:
-        cursor.execute("SELECT COUNT(*) FROM tasks WHERE created > ?", (int(time.time()) - 86400,))
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE created > ?", (int(time.time()) - TASK_LIFETIME,))
         active_tasks = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM completions WHERE time > ?", (int(time.time()) - 86400,))
+        cursor.execute("SELECT COUNT(*) FROM completions WHERE time > ?", (int(time.time()) - TASK_LIFETIME,))
         completions_today = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM tasks")
         total_tasks = cursor.fetchone()[0]
@@ -143,8 +146,8 @@ def stats(message):
         total_users = cursor.fetchone()[0]
 
     text = (f"📊 Статистика бота:\n\n"
-            f"Активных заданий (последние 24ч): {active_tasks}\n"
-            f"Выполнено за сутки: {completions_today}\n"
+            f"Активных заданий (последние {TASK_LIFETIME//3600} ч): {active_tasks}\n"
+            f"Выполнено за {TASK_LIFETIME//3600} ч: {completions_today}\n"
             f"Всего заданий: {total_tasks}\n"
             f"Всего пользователей: {total_users}")
     bot.send_message(user_id, text)
@@ -176,7 +179,7 @@ def debug_tasks(message):
     for task in tasks:
         task_id, chat_id, author, link, created, msg_id = task
         age_hours = (now - created) / 3600
-        status = "✅ истекло" if now - created > 86400 else f"⏳ {age_hours:.1f} ч"
+        status = "✅ истекло" if now - created > TASK_LIFETIME else f"⏳ {age_hours:.1f} ч"
         text += f"ID {task_id}: чат {chat_id}, автор @{author}, {status}\n"
         text += f"   ссылка: {link}\n"
     try:
@@ -207,7 +210,7 @@ def force_report(message):
     processed = 0
     for task in tasks:
         task_id, chat_id, author_id, author_name, msg_id, link, created = task
-        if now - created > 86400:
+        if now - created > TASK_LIFETIME:
             process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
             with db_lock:
                 cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
@@ -282,7 +285,7 @@ def my_tasks(message):
                   WHERE c.task_id = t.id AND c.user_id = ?
               )
             ORDER BY t.created DESC
-        """, (now - 86400, user_id, user_id))
+        """, (now - TASK_LIFETIME, user_id, user_id))
         tasks = cursor.fetchall()
 
     if not tasks:
@@ -425,7 +428,7 @@ def handle_message(message):
         with db_lock:
             cursor.execute(
                 "SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?",
-                (user_id, chat_id, now - 86400)
+                (user_id, chat_id, now - TASK_LIFETIME)
             )
             if cursor.fetchone()[0] >= 2:
                 bot.send_message(chat_id, f"❗ @{username}, лимит 2 задания в сутки исчерпан. Задание не создано.")
@@ -509,7 +512,7 @@ def scheduler():
 
             for task in tasks:
                 task_id, created, author_id, author_name, msg_id, link = task
-                if now - created > 86400:
+                if now - created > TASK_LIFETIME:
                     logger.info(f"Task {task_id} expired in chat {chat_id}")
                     process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
                     with db_lock:
