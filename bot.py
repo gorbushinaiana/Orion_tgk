@@ -347,7 +347,7 @@ def my_tasks(message):
         logger.warning(f"Markdown failed for /my_tasks: {e}")
         bot.send_message(user_id, response.replace('*', ''), disable_web_page_preview=True)
 
-# --- Обработчик кнопок ---
+# --- Обработчик кнопок (с защитой от ошибок) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
 def done(call):
     task_id = int(call.data.split("_")[1])
@@ -358,17 +358,27 @@ def done(call):
         task = cursor.fetchone()
 
     if not task:
-        bot.answer_callback_query(call.id, "Задание не найдено")
+        # Задание уже удалено (например, истекло)
+        try:
+            bot.answer_callback_query(call.id, "Задание уже завершено")
+        except Exception as e:
+            logger.warning(f"Failed to answer callback (task not found): {e}")
         return
 
     created, chat_id, author_id = task
 
     if call.from_user.id == author_id:
-        bot.answer_callback_query(call.id, "Нельзя выполнить своё задание")
+        try:
+            bot.answer_callback_query(call.id, "Нельзя выполнить своё задание")
+        except Exception as e:
+            logger.warning(f"Failed to answer callback (self-task): {e}")
         return
 
     if now - created < 10:
-        bot.answer_callback_query(call.id, "Подождите 10 секунд")
+        try:
+            bot.answer_callback_query(call.id, "Подождите 10 секунд")
+        except Exception as e:
+            logger.warning(f"Failed to answer callback (time limit): {e}")
         return
 
     with db_lock:
@@ -377,7 +387,10 @@ def done(call):
             (task_id, call.from_user.id, chat_id)
         )
         if cursor.fetchone():
-            bot.answer_callback_query(call.id, "Уже отмечено")
+            try:
+                bot.answer_callback_query(call.id, "Уже отмечено")
+            except Exception as e:
+                logger.warning(f"Failed to answer callback (already done): {e}")
             return
 
         cursor.execute(
@@ -392,7 +405,10 @@ def done(call):
         )
         conn.commit()
 
-    bot.answer_callback_query(call.id, "Задание выполнено!")
+    try:
+        bot.answer_callback_query(call.id, "Задание выполнено!")
+    except Exception as e:
+        logger.warning(f"Failed to answer callback (success): {e}")
 
 # --- Обработчик всех остальных сообщений ---
 @bot.message_handler(func=lambda m: True)
@@ -594,7 +610,8 @@ if __name__ == "__main__":
     logger.info("Бот запущен...")
     while True:
         try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
+            # Увеличили таймауты для уменьшения ошибок ReadTimeout
+            bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
         except telebot.apihelper.ApiTelegramException as e:
             logger.error(f"Polling error: {e}")
             if "409" in str(e):
