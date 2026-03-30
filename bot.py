@@ -129,7 +129,7 @@ def keyboard(task_id):
     ))
     return markup
 
-# --- Команда /stats (администраторы) ---
+# --- Команда /stats (только глобальные админы) ---
 @bot.message_handler(commands=['stats'])
 def stats(message):
     if message.chat.type != "private":
@@ -156,7 +156,7 @@ def stats(message):
             f"Всего пользователей: {total_users}")
     bot.send_message(user_id, text)
 
-# --- Команда /debug_tasks (администраторы) ---
+# --- Команда /debug_tasks (только глобальные админы) ---
 @bot.message_handler(commands=['debug_tasks'])
 def debug_tasks(message):
     if message.chat.type != "private":
@@ -191,7 +191,7 @@ def debug_tasks(message):
     except Exception as e:
         bot.send_message(user_id, text.replace('*', ''), disable_web_page_preview=True)
 
-# --- Команда /force_report (администраторы) ---
+# --- Команда /force_report (только глобальные админы) ---
 @bot.message_handler(commands=['force_report'])
 def force_report(message):
     if message.chat.type != "private":
@@ -230,19 +230,28 @@ def process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
         cursor.execute("SELECT username, id FROM users WHERE chat_id=?", (chat_id,))
         all_users = {row[0]: row[1] for row in cursor.fetchall()}
 
-    # Определяем администраторов чата
-    admins = set()
-    for uname, uid in all_users.items():
-        if is_admin(chat_id, uid):
-            admins.add(uname)
-
+    # Определяем администраторов чата и проверяем, кто реально в чате
     not_done = []
     for uname, uid in all_users.items():
-        if uname not in done_users and uname != author_name and uname not in admins:
-            if uname:
-                not_done.append(f"@{uname}")
-            else:
-                not_done.append(f"id{uid}")
+        # Пропускаем автора и администраторов
+        if uname == author_name or is_admin(chat_id, uid):
+            continue
+        # Пропускаем тех, кто уже выполнил задание
+        if uname in done_users:
+            continue
+
+        # Проверяем, состоит ли пользователь в чате в данный момент
+        try:
+            member = bot.get_chat_member(chat_id, uid)
+            if member.status in ["member", "administrator", "creator"]:
+                # Пользователь в чате – добавляем в отчёт
+                mention = f"@{uname}" if uname else f"id{uid}"
+                not_done.append(mention)
+            # Если статус "left" или "kicked", просто пропускаем
+        except Exception as e:
+            logger.warning(f"Failed to get member {uid} in chat {chat_id}: {e}")
+            # Если ошибка (например, пользователь не в чате), пропускаем
+            continue
 
     link_msg = task_link(chat_id, msg_id) or link
 
