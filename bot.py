@@ -27,7 +27,8 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-TASK_LIFETIME = 24 * 3600
+# Время жизни задания (48 часов, чтобы пользователи успевали)
+TASK_LIFETIME = 48 * 3600      # 48 часов
 USER_TASK_LIMIT_PERIOD = 12 * 3600
 MAX_TASKS_PER_USER = 2
 
@@ -88,10 +89,10 @@ with db_lock:
 members_cache = {}
 CACHE_TTL = 300
 
-def get_cached_member(chat_id, user_id):
+def get_cached_member(chat_id, user_id, force_refresh=False):
     cache_key = (chat_id, user_id)
     now = time.time()
-    if cache_key in members_cache:
+    if not force_refresh and cache_key in members_cache:
         status, ts = members_cache[cache_key]
         if now - ts < CACHE_TTL:
             return status
@@ -100,7 +101,8 @@ def get_cached_member(chat_id, user_id):
         status = member.status
         members_cache[cache_key] = (status, now)
         return status
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to get member {user_id} in chat {chat_id}: {e}")
         return None
 
 def is_admin_cached(chat_id, user_id):
@@ -280,7 +282,11 @@ def my_tasks(message):
         chat_id = task[0]
         status = get_cached_member(chat_id, user_id)
         if status in ["left", "kicked", None]:
-            continue
+            # Если статус не определён, пробуем обновить кеш
+            if status is None:
+                status = get_cached_member(chat_id, user_id, force_refresh=True)
+            if status in ["left", "kicked", None]:
+                continue
         if status in ["administrator", "creator"]:
             continue
         filtered.append(task)
@@ -311,39 +317,74 @@ def my_tasks(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
 def done(call):
     task_id = int(call.data.split("_")[1])
+    user_id = call.from_user.id
+    username = call.from_user.username or f"id{user_id}"
     now = int(time.time())
+
+    logger.info(f"Callback done: task_id={task_id}, user_id={user_id}, username={username}")
+
+    # Блокируем на всё время обработки, чтобы избежать гонок
     with db_lock:
+        # 1. Проверяем, существует ли задание и не истекло ли оно
         cursor.execute("SELECT created, chat_id, author FROM tasks WHERE id=?", (task_id,))
         task = cursor.fetchone()
-    if not task:
-        bot.answer_callback_query(call.id, "Задание уже завершено")
-        return
-    created, chat_id, author_id = task
-    if call.from_user.id == author_id:
-        bot.answer_callback_query(call.id, "Нельзя выполнить своё задание")
-        return
-    if now - created < 10:
-        bot.answer_callback_query(call.id, "Подождите 10 секунд")
-        return
-    status = get_cached_member(chat_id, call.from_user.id)
-    if status not in ["member", "administrator", "creator"]:
-        bot.answer_callback_query(call.id, "Вы не состоите в этом чате")
-        return
-    with db_lock:
-        cursor.execute("SELECT * FROM completions WHERE task_id=? AND user_id=? AND chat_id=?", (task_id, call.from_user.id, chat_id))
-        if cursor.fetchone():
-            bot.answer_callback_query(call.id, "Уже отмечено")
+
+        if not task:
+            logger.warning(f"Task {task_id} not found in tasks table (expired or deleted)")
+            bot.answer_callback_query(call.id, f"❌ Задание недоступно. Возможно, прошло более {TASK_LIFETIME//3600} часов.")
             return
+
+        created, chat_id, author_id = task
+        logger.info(f"Task found: created={created}, chat_id={chat_id}, author={author_id}")
+
+        # 2. Проверка на авторство
+        if user_id == author_id:
+            bot.answer_callback_query(call.id, "❌ Нельзя выполнить своё собственное задание.")
+            return
+
+        # 3. Защита от нажатия сразу после создания (10 секунд)
+        if now - created < 10:
+            bot.answer_callback_query(call.id, "⏳ Подождите 10 секунд после создания задания.")
+            return
+
+        # 4. Проверка членства в чате (с принудительным обновлением кеша)
+        status = get_cached_member(chat_id, user_id)
+        if status not in ["member", "administrator", "creator"]:
+            # Пробуем обновить кеш
+            status = get_cached_member(chat_id, user_id, force_refresh=True)
+            if status not in ["member", "administrator", "creator"]:
+                logger.info(f"User {user_id} not a member of chat {chat_id}, status={status}")
+                bot.answer_callback_query(call.id, "❌ Вы не состоите в этом чате. Вступите и попробуйте снова.")
+                return
+
+        # 5. Проверяем, не выполнял ли пользователь это задание ранее
+        cursor.execute("SELECT time FROM completions WHERE task_id=? AND user_id=? AND chat_id=?", (task_id, user_id, chat_id))
+        existing = cursor.fetchone()
+        if existing:
+            done_time = existing[0]
+            done_dt = datetime.datetime.fromtimestamp(done_time, tz=MSK).strftime("%Y-%m-%d %H:%M")
+            logger.info(f"User {user_id} already completed task {task_id} at {done_time}")
+            bot.answer_callback_query(call.id, f"✅ Вы уже отмечали это задание {done_dt} (МСК). Повторно не требуется.")
+            return
+
+        # 6. Всё хорошо, отмечаем выполнение
         cursor.execute(
             "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) VALUES (?, ?, ?, ?, ?, 1)",
-            (task_id, chat_id, call.from_user.id, call.from_user.username, now)
+            (task_id, chat_id, user_id, username, now)
         )
         cursor.execute(
             "INSERT OR REPLACE INTO users (id, chat_id, username, last_active) VALUES (?, ?, ?, ?)",
-            (call.from_user.id, chat_id, call.from_user.username, now)
+            (user_id, chat_id, username, now)
         )
         conn.commit()
-    bot.answer_callback_query(call.id, "Задание выполнено!")
+        logger.info(f"Completion recorded: task_id={task_id}, user_id={user_id}")
+
+    bot.answer_callback_query(call.id, "✅ Задание выполнено! Спасибо.")
+    # Дополнительно можно отредактировать сообщение, убрав кнопку
+    try:
+        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
+    except Exception as e:
+        logger.warning(f"Could not remove inline keyboard: {e}")
 
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
@@ -358,6 +399,7 @@ def handle_message(message):
     username = message.from_user.username or f"id{user_id}"
     is_user_admin = is_admin_cached(chat_id, user_id)
     now = int(time.time())
+
     with db_lock:
         cursor.execute(
             "INSERT INTO users (id, chat_id, username, last_active) VALUES (?, ?, ?, ?) "
@@ -365,33 +407,43 @@ def handle_message(message):
             (user_id, chat_id, username, now)
         )
         conn.commit()
+
+    # Проверка рабочего времени
     if not is_work_time(message.date):
         if not is_user_admin:
             try:
                 bot.delete_message(chat_id, message.message_id)
             except Exception as e:
-                logger.warning(f"Failed to delete message: {e}")
+                logger.warning(f"Failed to delete message (out of work time): {e}")
         return
+
+    # Поиск ссылки t.me
     match = re.search(link_pattern, message.text)
     if not match:
         if not is_user_admin:
             try:
                 bot.delete_message(chat_id, message.message_id)
             except Exception as e:
-                logger.warning(f"Failed to delete message: {e}")
+                logger.warning(f"Failed to delete message (no link): {e}")
         return
+
     link = match.group()
     activity = message.text.replace(link, "").strip() or "лайк"
+
+    # Лимит заданий для не-админов
     if not is_user_admin:
         with db_lock:
             cursor.execute("SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?", (user_id, chat_id, now - USER_TASK_LIMIT_PERIOD))
-            if cursor.fetchone()[0] >= MAX_TASKS_PER_USER:
-                bot.send_message(chat_id, f"❗ @{username}, лимит {MAX_TASKS_PER_USER} задания за {USER_TASK_LIMIT_PERIOD//3600} часов исчерпан.")
+            count = cursor.fetchone()[0]
+            if count >= MAX_TASKS_PER_USER:
+                bot.send_message(chat_id, f"❗ @{username}, лимит {MAX_TASKS_PER_USER} задания за {USER_TASK_LIMIT_PERIOD//3600} часов исчерпан. Подождите.")
                 try:
                     bot.delete_message(chat_id, message.message_id)
                 except Exception as e:
-                    logger.warning(f"Failed to delete message: {e}")
+                    logger.warning(f"Failed to delete message (limit exceeded): {e}")
                 return
+
+    # Создаём задание
     with db_lock:
         cursor.execute(
             "INSERT INTO tasks (chat_id, author, author_name, link, activity, created) VALUES (?, ?, ?, ?, ?, ?)",
@@ -399,15 +451,18 @@ def handle_message(message):
         )
         task_id = cursor.lastrowid
         conn.commit()
+
     sent = bot.send_message(chat_id, f"📢 Новое задание\n\n@{username}\n{link}\n{activity}", reply_markup=keyboard(task_id))
+
     with db_lock:
         cursor.execute("UPDATE tasks SET message_id=? WHERE id=?", (sent.message_id, task_id))
         conn.commit()
+
     if not is_user_admin:
         try:
             bot.delete_message(chat_id, message.message_id)
         except Exception as e:
-            logger.warning(f"Failed to delete message: {e}")
+            logger.warning(f"Failed to delete original message: {e}")
 
 # ==================== ПЛАНИРОВЩИК ====================
 def get_state(key, default=None):
@@ -430,6 +485,7 @@ def scheduler():
         hour = now_dt.hour
         week_num = now_dt.isocalendar()[1]
 
+        # Пятница 23:00
         if day == 4 and hour == 23:
             last_friday = get_state("last_friday_week")
             if last_friday != str(week_num):
@@ -443,6 +499,7 @@ def scheduler():
                         logger.error(f"Failed to send friday message in {chat_id}: {e}")
                 set_state("last_friday_week", week_num)
 
+        # Понедельник 7:00
         if day == 0 and hour == 7:
             last_monday = get_state("last_monday_week")
             if last_monday != str(week_num):
@@ -456,18 +513,21 @@ def scheduler():
                         logger.error(f"Failed to send monday message in {chat_id}: {e}")
                 set_state("last_monday_week", week_num)
 
+        # Удаление истекших заданий (только в рабочее время, чтобы не мешать)
         if not is_weekend_period(now):
             with db_lock:
                 cursor.execute("SELECT id, chat_id, author, author_name, message_id, link, created FROM tasks WHERE created <= ?", (now - TASK_LIFETIME,))
                 expired = cursor.fetchall()
             for task in expired:
                 task_id, chat_id, author_id, author_name, msg_id, link, created = task
+                logger.info(f"Task {task_id} expired, processing...")
                 process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
                 with db_lock:
                     cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                     conn.commit()
 
-        if day == 6 and hour == 12:
+        # Еженедельный отчёт по субботам в 12:00
+        if day == 5 and hour == 12:   # суббота
             last_report = get_state("last_report_week")
             if last_report != str(week_num):
                 week_ago = now - 604800
