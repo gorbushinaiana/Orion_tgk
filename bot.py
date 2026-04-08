@@ -27,8 +27,7 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-# Время жизни задания (48 часов, чтобы пользователи успевали)
-TASK_LIFETIME = 48 * 3600      # 48 часов
+TASK_LIFETIME = 24 * 3600
 USER_TASK_LIMIT_PERIOD = 12 * 3600
 MAX_TASKS_PER_USER = 2
 
@@ -78,6 +77,15 @@ with db_lock:
             value TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS link_clicks (
+            task_id INTEGER,
+            user_id INTEGER,
+            chat_id INTEGER,
+            clicked INTEGER DEFAULT 0,
+            PRIMARY KEY (task_id, user_id, chat_id)
+        )
+    """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_completions_task_user ON completions(task_id, user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_completions_chat ON completions(chat_id)")
@@ -89,10 +97,10 @@ with db_lock:
 members_cache = {}
 CACHE_TTL = 300
 
-def get_cached_member(chat_id, user_id, force_refresh=False):
+def get_cached_member(chat_id, user_id):
     cache_key = (chat_id, user_id)
     now = time.time()
-    if not force_refresh and cache_key in members_cache:
+    if cache_key in members_cache:
         status, ts = members_cache[cache_key]
         if now - ts < CACHE_TTL:
             return status
@@ -101,8 +109,7 @@ def get_cached_member(chat_id, user_id, force_refresh=False):
         status = member.status
         members_cache[cache_key] = (status, now)
         return status
-    except Exception as e:
-        logger.warning(f"Failed to get member {user_id} in chat {chat_id}: {e}")
+    except Exception:
         return None
 
 def is_admin_cached(chat_id, user_id):
@@ -155,11 +162,9 @@ def task_link(chat_id, message_id):
         return f"https://t.me/c/{cid}/{message_id}"
     return None
 
-def keyboard(task_id):
+def get_task_keyboard(task_id):
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton(
-        "✅ Актив выполнен", callback_data=f"done_{task_id}"
-    ))
+    markup.add(telebot.types.InlineKeyboardButton("🔗 Перейти к заданию", callback_data=f"goto_{task_id}"))
     return markup
 
 def reset_telegram_webhook(token):
@@ -282,11 +287,7 @@ def my_tasks(message):
         chat_id = task[0]
         status = get_cached_member(chat_id, user_id)
         if status in ["left", "kicked", None]:
-            # Если статус не определён, пробуем обновить кеш
-            if status is None:
-                status = get_cached_member(chat_id, user_id, force_refresh=True)
-            if status in ["left", "kicked", None]:
-                continue
+            continue
         if status in ["administrator", "creator"]:
             continue
         filtered.append(task)
@@ -308,84 +309,121 @@ def my_tasks(message):
             msg_link = task_link(chat_id, msg_id) or link
             response += f"• [Задание]({msg_link})\n"
         response += "\n"
-    response += "Нажмите на ссылку, чтобы перейти к заданию, затем выполните его и нажмите кнопку ✅ Актив выполнен."
+    response += "Нажмите кнопку «Перейти к заданию» под сообщением, затем перейдите по ссылке из личного чата с ботом и выполните актив."
     try:
         bot.send_message(user_id, response, parse_mode='Markdown', disable_web_page_preview=True)
     except Exception as e:
         bot.send_message(user_id, response.replace('*', ''), disable_web_page_preview=True)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
-def done(call):
+@bot.message_handler(commands=['howto'])
+def howto(message):
+    user_id = message.from_user.id
+    instruction = (
+        "📖 *Инструкция по выполнению заданий*\n\n"
+        "1️⃣ Бот публикует задание с кнопкой «🔗 Перейти к заданию».\n\n"
+        "2️⃣ Нажмите эту кнопку – бот *сразу засчитает* вам задание и отправит ссылку на актив в *личные сообщения*.\n\n"
+        "3️⃣ Перейдите по ссылке и выполните актив (лайк, репост, подписка и т.п.).\n\n"
+        "4️⃣ Задание считается выполненным сразу после нажатия кнопки. Ссылка остаётся у вас в личке.\n\n"
+        "⚠️ Если вы нажмёте кнопку повторно, бот просто отправит ссылку ещё раз – ошибки не будет.\n\n"
+        "📌 Если бот не присылает ссылку – убедитесь, что он не заблокирован, и напишите ему /start."
+    )
+    try:
+        bot.send_message(user_id, instruction, parse_mode='Markdown')
+        if message.chat.type != "private":
+            bot.send_message(message.chat.id, "📩 Инструкция отправлена в личные сообщения.")
+    except Exception as e:
+        logger.error(f"Failed to send howto to {user_id}: {e}")
+        if message.chat.type != "private":
+            bot.send_message(message.chat.id, "❌ Не удалось отправить инструкцию в ЛС. Напишите боту /start и попробуйте снова.")
+
+@bot.message_handler(commands=['broadcast'])
+def broadcast(message):
+    if message.chat.type != "private":
+        return
+    if not is_admin_cached(None, message.from_user.id):
+        bot.send_message(message.chat.id, "У вас нет прав.")
+        return
+    text = message.text.replace('/broadcast', '', 1).strip()
+    if not text:
+        bot.send_message(message.chat.id, "Укажите текст для рассылки. Пример: /broadcast Внимание, новое правило!")
+        return
+    with db_lock:
+        cursor.execute("SELECT DISTINCT chat_id FROM users")
+        chats = [row[0] for row in cursor.fetchall()]
+    sent = 0
+    for chat_id in chats:
+        try:
+            bot.send_message(chat_id, text)
+            sent += 1
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Failed to broadcast to {chat_id}: {e}")
+    bot.send_message(message.chat.id, f"📢 Сообщение отправлено в {sent} чатов.")
+
+# ==================== ОСНОВНОЙ ОБРАБОТЧИК КНОПКИ ====================
+@bot.callback_query_handler(func=lambda call: call.data.startswith("goto_"))
+def handle_goto(call):
     task_id = int(call.data.split("_")[1])
     user_id = call.from_user.id
-    username = call.from_user.username or f"id{user_id}"
+    chat_id = call.message.chat.id
     now = int(time.time())
 
-    logger.info(f"Callback done: task_id={task_id}, user_id={user_id}, username={username}")
-
-    # Блокируем на всё время обработки, чтобы избежать гонок
     with db_lock:
-        # 1. Проверяем, существует ли задание и не истекло ли оно
-        cursor.execute("SELECT created, chat_id, author FROM tasks WHERE id=?", (task_id,))
-        task = cursor.fetchone()
-
-        if not task:
-            logger.warning(f"Task {task_id} not found in tasks table (expired or deleted)")
-            bot.answer_callback_query(call.id, f"❌ Задание недоступно. Возможно, прошло более {TASK_LIFETIME//3600} часов.")
+        cursor.execute("SELECT link, author, created FROM tasks WHERE id=?", (task_id,))
+        row = cursor.fetchone()
+        if not row:
+            bot.answer_callback_query(call.id, "❌ Задание устарело или было удалено. Создайте новое.")
             return
+        original_link, author_id, created = row
 
-        created, chat_id, author_id = task
-        logger.info(f"Task found: created={created}, chat_id={chat_id}, author={author_id}")
-
-        # 2. Проверка на авторство
+        # Проверки
         if user_id == author_id:
-            bot.answer_callback_query(call.id, "❌ Нельзя выполнить своё собственное задание.")
+            bot.answer_callback_query(call.id, "❌ Нельзя выполнить своё задание")
             return
-
-        # 3. Защита от нажатия сразу после создания (10 секунд)
         if now - created < 10:
-            bot.answer_callback_query(call.id, "⏳ Подождите 10 секунд после создания задания.")
+            bot.answer_callback_query(call.id, "⏳ Подождите 10 секунд после создания задания")
             return
-
-        # 4. Проверка членства в чате (с принудительным обновлением кеша)
         status = get_cached_member(chat_id, user_id)
         if status not in ["member", "administrator", "creator"]:
-            # Пробуем обновить кеш
-            status = get_cached_member(chat_id, user_id, force_refresh=True)
-            if status not in ["member", "administrator", "creator"]:
-                logger.info(f"User {user_id} not a member of chat {chat_id}, status={status}")
-                bot.answer_callback_query(call.id, "❌ Вы не состоите в этом чате. Вступите и попробуйте снова.")
-                return
-
-        # 5. Проверяем, не выполнял ли пользователь это задание ранее
-        cursor.execute("SELECT time FROM completions WHERE task_id=? AND user_id=? AND chat_id=?", (task_id, user_id, chat_id))
-        existing = cursor.fetchone()
-        if existing:
-            done_time = existing[0]
-            done_dt = datetime.datetime.fromtimestamp(done_time, tz=MSK).strftime("%Y-%m-%d %H:%M")
-            logger.info(f"User {user_id} already completed task {task_id} at {done_time}")
-            bot.answer_callback_query(call.id, f"✅ Вы уже отмечали это задание {done_dt} (МСК). Повторно не требуется.")
+            bot.answer_callback_query(call.id, "❌ Вы не состоите в этом чате")
             return
 
-        # 6. Всё хорошо, отмечаем выполнение
+        # Проверяем, не выполнено ли уже
+        cursor.execute("SELECT * FROM completions WHERE task_id=? AND user_id=? AND chat_id=?", (task_id, user_id, chat_id))
+        if cursor.fetchone():
+            # Уже выполнено – повторно отправляем ссылку (полезно, если пользователь потерял)
+            bot.answer_callback_query(call.id, "ℹ️ Вы уже выполнили это задание. Ссылка повторно отправлена в личные сообщения.")
+            try:
+                bot.send_message(user_id, f"🔗 Повторная ссылка на задание из чата {call.message.chat.title}:\n{original_link}\n\nВы уже получили за него актив. Спасибо!")
+            except Exception as e:
+                logger.error(f"Failed to resend link to {user_id}: {e}")
+            return
+
+        # Фиксируем переход и засчитываем выполнение
+        cursor.execute("INSERT OR REPLACE INTO link_clicks (task_id, user_id, chat_id, clicked) VALUES (?, ?, ?, 1)", (task_id, user_id, chat_id))
         cursor.execute(
             "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) VALUES (?, ?, ?, ?, ?, 1)",
-            (task_id, chat_id, user_id, username, now)
+            (task_id, chat_id, user_id, call.from_user.username, now)
         )
         cursor.execute(
             "INSERT OR REPLACE INTO users (id, chat_id, username, last_active) VALUES (?, ?, ?, ?)",
-            (user_id, chat_id, username, now)
+            (user_id, chat_id, call.from_user.username, now)
         )
         conn.commit()
-        logger.info(f"Completion recorded: task_id={task_id}, user_id={user_id}")
 
-    bot.answer_callback_query(call.id, "✅ Задание выполнено! Спасибо.")
-    # Дополнительно можно отредактировать сообщение, убрав кнопку
+    bot.answer_callback_query(call.id, "✅ Задание засчитано! Ссылка на актив отправлена в личные сообщения.")
     try:
-        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=None)
+        bot.send_message(
+            user_id,
+            f"🔗 Вот ссылка на актив из чата {call.message.chat.title}:\n{original_link}\n\n"
+            "👉 Перейдите по ней и поддержите автора (лайк, репост и т.п.).\n"
+            "Благодарим за участие!"
+        )
     except Exception as e:
-        logger.warning(f"Could not remove inline keyboard: {e}")
+        logger.error(f"Failed to send link to user {user_id}: {e}")
+        bot.answer_callback_query(call.id, "❌ Не удалось отправить ссылку в ЛС. Напишите боту /start и нажмите кнопку ещё раз.")
 
+# ==================== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ====================
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     if message.chat.type == "private":
@@ -408,42 +446,37 @@ def handle_message(message):
         )
         conn.commit()
 
-    # Проверка рабочего времени
     if not is_work_time(message.date):
         if not is_user_admin:
             try:
                 bot.delete_message(chat_id, message.message_id)
             except Exception as e:
-                logger.warning(f"Failed to delete message (out of work time): {e}")
+                logger.warning(f"Failed to delete message: {e}")
         return
 
-    # Поиск ссылки t.me
     match = re.search(link_pattern, message.text)
     if not match:
         if not is_user_admin:
             try:
                 bot.delete_message(chat_id, message.message_id)
             except Exception as e:
-                logger.warning(f"Failed to delete message (no link): {e}")
+                logger.warning(f"Failed to delete message: {e}")
         return
 
     link = match.group()
     activity = message.text.replace(link, "").strip() or "лайк"
 
-    # Лимит заданий для не-админов
     if not is_user_admin:
         with db_lock:
             cursor.execute("SELECT COUNT(*) FROM tasks WHERE author=? AND chat_id=? AND created>?", (user_id, chat_id, now - USER_TASK_LIMIT_PERIOD))
-            count = cursor.fetchone()[0]
-            if count >= MAX_TASKS_PER_USER:
-                bot.send_message(chat_id, f"❗ @{username}, лимит {MAX_TASKS_PER_USER} задания за {USER_TASK_LIMIT_PERIOD//3600} часов исчерпан. Подождите.")
+            if cursor.fetchone()[0] >= MAX_TASKS_PER_USER:
+                bot.send_message(chat_id, f"❗ @{username}, лимит {MAX_TASKS_PER_USER} задания за {USER_TASK_LIMIT_PERIOD//3600} часов исчерпан.")
                 try:
                     bot.delete_message(chat_id, message.message_id)
                 except Exception as e:
-                    logger.warning(f"Failed to delete message (limit exceeded): {e}")
+                    logger.warning(f"Failed to delete message: {e}")
                 return
 
-    # Создаём задание
     with db_lock:
         cursor.execute(
             "INSERT INTO tasks (chat_id, author, author_name, link, activity, created) VALUES (?, ?, ?, ?, ?, ?)",
@@ -452,8 +485,11 @@ def handle_message(message):
         task_id = cursor.lastrowid
         conn.commit()
 
-    sent = bot.send_message(chat_id, f"📢 Новое задание\n\n@{username}\n{link}\n{activity}", reply_markup=keyboard(task_id))
-
+    sent = bot.send_message(
+        chat_id,
+        f"📢 Новое задание\n\n@{username}\n{activity}\n\n⬇️ Нажмите «Перейти к заданию», ссылка придёт в личные сообщения.",
+        reply_markup=get_task_keyboard(task_id)
+    )
     with db_lock:
         cursor.execute("UPDATE tasks SET message_id=? WHERE id=?", (sent.message_id, task_id))
         conn.commit()
@@ -462,7 +498,7 @@ def handle_message(message):
         try:
             bot.delete_message(chat_id, message.message_id)
         except Exception as e:
-            logger.warning(f"Failed to delete original message: {e}")
+            logger.warning(f"Failed to delete message: {e}")
 
 # ==================== ПЛАНИРОВЩИК ====================
 def get_state(key, default=None):
@@ -476,6 +512,33 @@ def set_state(key, value):
         cursor.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, str(value)))
         conn.commit()
 
+def send_update_notification():
+    """Один раз отправляет в каждый чат уведомление об обновлении бота (одна кнопка)"""
+    with db_lock:
+        cursor.execute("SELECT DISTINCT chat_id FROM users")
+        chats = [row[0] for row in cursor.fetchall()]
+    for chat_id in chats:
+        key = f"update_notified_{chat_id}"
+        if get_state(key) == "1":
+            continue
+        try:
+            bot.send_message(
+                chat_id,
+                "🔄 *Внимание! Бот обновлён!*\n\n"
+                "Теперь для выполнения задания нужно:\n"
+                "1️⃣ Нажать кнопку *«Перейти к заданию»* под сообщением задания.\n"
+                "2️⃣ Получить ссылку в личные сообщения и перейти по ней.\n"
+                "3️⃣ Выполнить актив.\n\n"
+                "Задание засчитывается автоматически после нажатия кнопки. Инструкция: /howto\n"
+                "Если вы нажмёте кнопку повторно, бот просто отправит ссылку ещё раз.\n\n"
+                "Спасибо за понимание!",
+                parse_mode='Markdown'
+            )
+            set_state(key, "1")
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Failed to send update notification to {chat_id}: {e}")
+
 def scheduler():
     logger.info("Scheduler started")
     while True:
@@ -485,7 +548,6 @@ def scheduler():
         hour = now_dt.hour
         week_num = now_dt.isocalendar()[1]
 
-        # Пятница 23:00
         if day == 4 and hour == 23:
             last_friday = get_state("last_friday_week")
             if last_friday != str(week_num):
@@ -499,7 +561,6 @@ def scheduler():
                         logger.error(f"Failed to send friday message in {chat_id}: {e}")
                 set_state("last_friday_week", week_num)
 
-        # Понедельник 7:00
         if day == 0 and hour == 7:
             last_monday = get_state("last_monday_week")
             if last_monday != str(week_num):
@@ -513,21 +574,18 @@ def scheduler():
                         logger.error(f"Failed to send monday message in {chat_id}: {e}")
                 set_state("last_monday_week", week_num)
 
-        # Удаление истекших заданий (только в рабочее время, чтобы не мешать)
         if not is_weekend_period(now):
             with db_lock:
                 cursor.execute("SELECT id, chat_id, author, author_name, message_id, link, created FROM tasks WHERE created <= ?", (now - TASK_LIFETIME,))
                 expired = cursor.fetchall()
             for task in expired:
                 task_id, chat_id, author_id, author_name, msg_id, link, created = task
-                logger.info(f"Task {task_id} expired, processing...")
                 process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
                 with db_lock:
                     cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                     conn.commit()
 
-        # Еженедельный отчёт по субботам в 12:00
-        if day == 5 and hour == 12:   # суббота
+        if day == 6 and hour == 12:
             last_report = get_state("last_report_week")
             if last_report != str(week_num):
                 week_ago = now - 604800
@@ -583,9 +641,11 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# ==================== ЗАПУСК ====================
 if __name__ == "__main__":
     reset_telegram_webhook(TOKEN)
     time.sleep(5)
+    threading.Thread(target=send_update_notification, daemon=True).start()
     threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=scheduler, daemon=True).start()
     logger.info("Бот запущен...")
