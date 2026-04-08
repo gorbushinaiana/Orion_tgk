@@ -79,52 +79,12 @@ with db_lock:
             value TEXT
         )
     """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS link_clicks (
-            task_id INTEGER,
-            user_id INTEGER,
-            chat_id INTEGER,
-            clicked INTEGER DEFAULT 0,
-            PRIMARY KEY (task_id, user_id, chat_id)
-        )
-    """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_completions_task_user ON completions(task_id, user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_completions_chat ON completions(chat_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_chat_id ON users(chat_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_chat_id ON tasks(chat_id)")
     conn.commit()
-
-# ==================== КЭШ СТАТУСОВ УЧАСТНИКОВ ====================
-members_cache = {}
-CACHE_TTL = 300
-
-def get_cached_member(chat_id, user_id, force_refresh=False):
-    cache_key = (chat_id, user_id)
-    now = time.time()
-    if not force_refresh and cache_key in members_cache:
-        status, ts = members_cache[cache_key]
-        if now - ts < CACHE_TTL:
-            return status
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        status = member.status
-        members_cache[cache_key] = (status, now)
-        return status
-    except Exception as e:
-        logger.warning(f"Failed to get member {user_id} in chat {chat_id}: {e}")
-        return None
-
-def is_admin_cached(chat_id, user_id):
-    admin_ids = os.environ.get("ADMIN_IDS", "")
-    if admin_ids:
-        admin_list = [int(x.strip()) for x in admin_ids.split(",") if x.strip().isdigit()]
-        if user_id in admin_list:
-            return True
-    if chat_id is None:
-        return False
-    status = get_cached_member(chat_id, user_id)
-    return status in ["administrator", "creator"]
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def msk_now():
@@ -153,9 +113,12 @@ def task_link(chat_id, message_id):
         return f"https://t.me/c/{cid}/{message_id}"
     return None
 
-def get_task_keyboard(task_id):
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("🔗 Перейти к заданию", callback_data=f"goto_{task_id}"))
+def get_task_keyboard(task_id, original_link):
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    # Кнопка-ссылка (открывает оригинальный пост)
+    markup.add(telebot.types.InlineKeyboardButton("🔗 Открыть задание", url=original_link))
+    # Кнопка подтверждения
+    markup.add(telebot.types.InlineKeyboardButton("✅ Я выполнил", callback_data=f"done_{task_id}"))
     return markup
 
 def reset_telegram_webhook(token):
@@ -167,6 +130,19 @@ def reset_telegram_webhook(token):
             logger.error(f"Webhook reset failed: {resp.text}")
     except Exception as e:
         logger.error(f"Error resetting webhook: {e}")
+
+def is_admin(chat_id, user_id):
+    admin_ids = os.environ.get("ADMIN_IDS", "")
+    if admin_ids:
+        admin_list = [int(x.strip()) for x in admin_ids.split(",") if x.strip().isdigit()]
+        if user_id in admin_list:
+            return True
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        return member.status in ["administrator", "creator"]
+    except Exception as e:
+        logger.warning(f"Failed to check admin status for {user_id} in {chat_id}: {e}")
+        return False
 
 def get_non_completers(chat_id, task_id, author_id, author_name):
     with db_lock:
@@ -187,7 +163,7 @@ def get_non_completers(chat_id, task_id, author_id, author_name):
 
     admin_ids = set()
     for uid in list(all_user_ids):
-        if is_admin_cached(chat_id, uid):
+        if is_admin(chat_id, uid):
             admin_ids.add(uid)
     all_user_ids -= admin_ids
 
@@ -219,14 +195,17 @@ def process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
 
     not_done = []
     for uname, uid in all_users.items():
-        if uname == author_name or is_admin_cached(chat_id, uid):
+        if uname == author_name or is_admin(chat_id, uid):
             continue
         if uname in done_users:
             continue
-        status = get_cached_member(chat_id, uid)
-        if status in ["member", "administrator", "creator"]:
-            mention = f"@{uname}" if uname else f"id{uid}"
-            not_done.append(mention)
+        try:
+            member = bot.get_chat_member(chat_id, uid)
+            if member.status in ["member", "administrator", "creator"]:
+                mention = f"@{uname}" if uname else f"id{uid}"
+                not_done.append(mention)
+        except:
+            continue
 
     link_msg = task_link(chat_id, msg_id) or link
 
@@ -270,13 +249,13 @@ def process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
 # ==================== КОМАНДЫ ====================
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
-    bot.send_message(message.chat.id, "Привет! Я бот взаимной активности. Теперь я могу отправлять вам ссылки на задания. Используйте меня в чатах.")
+    bot.send_message(message.chat.id, "Привет! Я бот взаимной активности. Просто нажимайте кнопки под заданиями.")
 
 @bot.message_handler(commands=['stats'])
 def stats(message):
     if message.chat.type != "private":
         return
-    if not is_admin_cached(None, message.from_user.id):
+    if not is_admin(None, message.from_user.id):
         bot.send_message(message.chat.id, "У вас нет прав.")
         return
     with db_lock:
@@ -320,12 +299,15 @@ def my_tasks(message):
     filtered = []
     for task in tasks:
         chat_id = task[0]
-        status = get_cached_member(chat_id, user_id, force_refresh=True)
-        if status in ["left", "kicked", None]:
+        try:
+            member = bot.get_chat_member(chat_id, user_id)
+            if member.status in ["left", "kicked"]:
+                continue
+            if member.status in ["administrator", "creator"]:
+                continue
+            filtered.append(task)
+        except:
             continue
-        if status in ["administrator", "creator"]:
-            continue
-        filtered.append(task)
     if not filtered:
         bot.send_message(user_id, "✅ У вас нет активных невыполненных заданий.")
         return
@@ -344,7 +326,7 @@ def my_tasks(message):
             msg_link = task_link(chat_id, msg_id) or link
             response += f"• [Задание]({msg_link})\n"
         response += "\n"
-    response += "Нажмите кнопку «Перейти к заданию» под сообщением, затем перейдите по ссылке из личного чата с ботом и выполните актив."
+    response += "Откройте задание по ссылке, выполните актив и нажмите кнопку «Я выполнил» под сообщением."
     try:
         bot.send_message(user_id, response, parse_mode='Markdown', disable_web_page_preview=True)
     except Exception as e:
@@ -355,12 +337,13 @@ def howto(message):
     user_id = message.from_user.id
     instruction = (
         "📖 *Инструкция по выполнению заданий*\n\n"
-        "1️⃣ Бот публикует задание с кнопкой «🔗 Перейти к заданию».\n\n"
-        "2️⃣ Нажмите эту кнопку – бот *сразу засчитает* вам задание и отправит ссылку на актив в *личные сообщения*.\n\n"
-        "3️⃣ Перейдите по ссылке и выполните актив (лайк, репост, подписка и т.п.).\n\n"
-        "4️⃣ Задание считается выполненным сразу после нажатия кнопки. Ссылка остаётся у вас в личке.\n\n"
-        "⚠️ Если вы нажмёте кнопку повторно, бот просто отправит ссылку ещё раз – ошибки не будет.\n\n"
-        "📌 Если бот не присылает ссылку – убедитесь, что он не заблокирован, и напишите ему /start."
+        "1️⃣ Бот публикует задание с двумя кнопками:\n"
+        "   • «🔗 Открыть задание» – ведёт на пост автора.\n"
+        "   • «✅ Я выполнил» – подтверждение выполнения.\n\n"
+        "2️⃣ Перейдите по ссылке, выполните актив (лайк, репост, подписка).\n\n"
+        "3️⃣ Вернитесь в чат и нажмите «✅ Я выполнил» – задание будет засчитано.\n\n"
+        "⚠️ Нажимайте кнопку подтверждения *только после реального выполнения*.\n\n"
+        "📌 Если вы случайно нажали подтверждение – ничего страшного, задание зачтётся один раз."
     )
     try:
         bot.send_message(user_id, instruction, parse_mode='Markdown')
@@ -375,7 +358,7 @@ def howto(message):
 def broadcast(message):
     if message.chat.type != "private":
         return
-    if not is_admin_cached(None, message.from_user.id):
+    if not is_admin(None, message.from_user.id):
         bot.send_message(message.chat.id, "У вас нет прав.")
         return
     text = message.text.replace('/broadcast', '', 1).strip()
@@ -405,13 +388,13 @@ def export_csv(message):
         with db_lock:
             cursor.execute("SELECT DISTINCT chat_id FROM users WHERE id=?", (user_id,))
             all_chats = [row[0] for row in cursor.fetchall()]
-        admin_chats = [cid for cid in all_chats if is_admin_cached(cid, user_id)]
+        admin_chats = [cid for cid in all_chats if is_admin(cid, user_id)]
         if not admin_chats:
             bot.send_message(user_id, "❌ Вы не администратор ни в одном из чатов, где есть бот.")
             return
         target_chats = admin_chats
     else:
-        if not is_admin_cached(chat_id, user_id):
+        if not is_admin(chat_id, user_id):
             bot.send_message(chat_id, "❌ Команда доступна только администраторам чата.")
             return
         target_chats = [chat_id]
@@ -464,29 +447,21 @@ def export_csv(message):
         logger.error(f"Failed to send CSV: {e}")
         bot.send_message(user_id if is_private else chat_id, "❌ Ошибка при отправке файла.")
 
-# ==================== ОСНОВНОЙ ОБРАБОТЧИК КНОПКИ ====================
-@bot.callback_query_handler(func=lambda call: call.data.startswith("goto_"))
-def handle_goto(call):
+# ==================== ОСНОВНОЙ ОБРАБОТЧИК КНОПКИ (подтверждение) ====================
+@bot.callback_query_handler(func=lambda call: call.data.startswith("done_"))
+def handle_done(call):
     task_id = int(call.data.split("_")[1])
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     now = int(time.time())
 
-    # Проверяем, может ли бот отправить сообщение пользователю
-    try:
-        bot.send_chat_action(user_id, 'typing')
-    except Exception as e:
-        logger.warning(f"Cannot send message to user {user_id}: {e}")
-        bot.answer_callback_query(call.id, "❌ Не могу отправить вам ссылку в личные сообщения. Напишите боту /start и повторите попытку.")
-        return
-
     with db_lock:
-        cursor.execute("SELECT link, author, created FROM tasks WHERE id=?", (task_id,))
+        cursor.execute("SELECT author, created FROM tasks WHERE id=?", (task_id,))
         row = cursor.fetchone()
         if not row:
             bot.answer_callback_query(call.id, "❌ Задание устарело или было удалено.")
             return
-        original_link, author_id, created = row
+        author_id, created = row
 
         if user_id == author_id:
             bot.answer_callback_query(call.id, "❌ Нельзя выполнить своё задание")
@@ -495,44 +470,24 @@ def handle_goto(call):
             bot.answer_callback_query(call.id, "⏳ Подождите 10 секунд после создания задания")
             return
 
-        status = get_cached_member(chat_id, user_id, force_refresh=True)
-        if status not in ["member", "administrator", "creator"]:
-            bot.answer_callback_query(call.id, "❌ Вы не состоите в этом чате или бот не может проверить. Попробуйте позже.")
-            return
-
+        # Проверяем, не выполнено ли уже
         cursor.execute("SELECT * FROM completions WHERE task_id=? AND user_id=? AND chat_id=?", (task_id, user_id, chat_id))
-        already_done = cursor.fetchone()
-
-        if already_done:
-            bot.answer_callback_query(call.id, "ℹ️ Вы уже выполнили это задание. Ссылка повторно отправлена в личные сообщения.")
-            try:
-                bot.send_message(user_id, f"🔗 Повторная ссылка на задание из чата {call.message.chat.title}:\n{original_link}\n\nВы уже получили за него актив. Спасибо!")
-            except Exception as e:
-                logger.error(f"Failed to resend link to {user_id}: {e}")
+        if cursor.fetchone():
+            bot.answer_callback_query(call.id, "ℹ️ Вы уже выполнили это задание")
             return
-        else:
-            cursor.execute("INSERT OR REPLACE INTO link_clicks (task_id, user_id, chat_id, clicked) VALUES (?, ?, ?, 1)", (task_id, user_id, chat_id))
-            cursor.execute(
-                "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) VALUES (?, ?, ?, ?, ?, 1)",
-                (task_id, chat_id, user_id, call.from_user.username, now)
-            )
-            cursor.execute(
-                "INSERT OR REPLACE INTO users (id, chat_id, username, last_active) VALUES (?, ?, ?, ?)",
-                (user_id, chat_id, call.from_user.username, now)
-            )
-            conn.commit()
 
-            bot.answer_callback_query(call.id, "✅ Задание засчитано! Ссылка на актив отправлена в личные сообщения.")
-            try:
-                bot.send_message(
-                    user_id,
-                    f"🔗 Вот ссылка на актив из чата {call.message.chat.title}:\n{original_link}\n\n"
-                    "👉 Перейдите по ней и поддержите автора (лайк, репост и т.п.).\n"
-                    "Благодарим за участие!"
-                )
-            except Exception as e:
-                logger.error(f"Failed to send link to user {user_id}: {e}")
-                bot.answer_callback_query(call.id, "❌ Не удалось отправить ссылку в ЛС. Напишите боту /start и нажмите кнопку ещё раз.")
+        # Засчитываем выполнение
+        cursor.execute(
+            "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) VALUES (?, ?, ?, ?, ?, 1)",
+            (task_id, chat_id, user_id, call.from_user.username, now)
+        )
+        cursor.execute(
+            "INSERT OR REPLACE INTO users (id, chat_id, username, last_active) VALUES (?, ?, ?, ?)",
+            (user_id, chat_id, call.from_user.username, now)
+        )
+        conn.commit()
+
+    bot.answer_callback_query(call.id, "✅ Задание выполнено! Спасибо за активность.")
 
 # ==================== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ====================
 @bot.message_handler(func=lambda m: True)
@@ -546,7 +501,7 @@ def handle_message(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
     username = message.from_user.username or f"id{user_id}"
-    is_user_admin = is_admin_cached(chat_id, user_id)
+    is_user_admin = is_admin(chat_id, user_id)
     now = int(time.time())
 
     with db_lock:
@@ -591,10 +546,11 @@ def handle_message(message):
         task_id = cursor.lastrowid
         conn.commit()
 
+    # Отправляем сообщение с двумя кнопками
     sent = bot.send_message(
         chat_id,
-        f"📢 Новое задание\n\n@{username}\n{activity}\n\n⬇️ Нажмите «Перейти к заданию», ссылка придёт в личные сообщения.",
-        reply_markup=get_task_keyboard(task_id)
+        f"📢 Новое задание\n\n@{username}\n{activity}\n\n⬇️ Перейдите по ссылке, выполните актив и нажмите подтверждение.",
+        reply_markup=get_task_keyboard(task_id, link)
     )
     with db_lock:
         cursor.execute("UPDATE tasks SET message_id=? WHERE id=?", (sent.message_id, task_id))
@@ -630,12 +586,13 @@ def send_update_notification():
             bot.send_message(
                 chat_id,
                 "🔄 *Внимание! Бот обновлён!*\n\n"
-                "Теперь для выполнения задания нужно:\n"
-                "1️⃣ Нажать кнопку *«Перейти к заданию»* под сообщением задания.\n"
-                "2️⃣ Получить ссылку в личные сообщения и перейти по ней.\n"
-                "3️⃣ Выполнить актив.\n\n"
-                "Задание засчитывается автоматически после нажатия кнопки. Инструкция: /howto\n"
-                "Если вы нажмёте кнопку повторно, бот просто отправит ссылку ещё раз.\n\n"
+                "Теперь задания публикуются с двумя кнопками:\n"
+                "• «🔗 Открыть задание» – ссылка на пост автора.\n"
+                "• «✅ Я выполнил» – подтверждение выполнения.\n\n"
+                "Порядок действий:\n"
+                "1. Перейдите по ссылке, выполните актив.\n"
+                "2. Вернитесь в чат и нажмите «✅ Я выполнил».\n\n"
+                "Инструкция: /howto\n"
                 "Спасибо за понимание!",
                 parse_mode='Markdown'
             )
