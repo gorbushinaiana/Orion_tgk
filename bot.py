@@ -506,7 +506,7 @@ def handle_goto(call):
         bot.send_message(
             user_id,
             f"🔗 Вот ссылка на актив из чата {call.message.chat.title}:\n{original_link}\n\n"
-            "👉 Перейдите по ней и поддержите автора (лайк, репост и т.п.).\n"
+            "👉 Перейдите по ней и поддержите автора (актив, который попросил автор).\n"
             "Благодарим за участие!"
         )
     except Exception as e:
