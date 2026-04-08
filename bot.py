@@ -99,10 +99,10 @@ with db_lock:
 members_cache = {}
 CACHE_TTL = 300
 
-def get_cached_member(chat_id, user_id):
+def get_cached_member(chat_id, user_id, force_refresh=False):
     cache_key = (chat_id, user_id)
     now = time.time()
-    if cache_key in members_cache:
+    if not force_refresh and cache_key in members_cache:
         status, ts = members_cache[cache_key]
         if now - ts < CACHE_TTL:
             return status
@@ -111,7 +111,8 @@ def get_cached_member(chat_id, user_id):
         status = member.status
         members_cache[cache_key] = (status, now)
         return status
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to get member {user_id} in chat {chat_id}: {e}")
         return None
 
 def is_admin_cached(chat_id, user_id):
@@ -130,25 +131,20 @@ def msk_now():
     return datetime.datetime.now(MSK)
 
 def is_weekend_period(now_ts=None):
-    """Возвращает True, если сейчас с пятницы 23:00 до понедельника 7:00 MSK"""
     if now_ts is None:
         now_ts = int(time.time())
     dt = datetime.datetime.fromtimestamp(now_ts, tz=MSK)
     weekday = dt.weekday()
     hour = dt.hour
-    # Пятница после 23:00
     if weekday == 4 and hour >= 23:
         return True
-    # Суббота и воскресенье целиком
     if weekday == 5 or weekday == 6:
         return True
-    # Понедельник до 7:00
     if weekday == 0 and hour < 7:
         return True
     return False
 
 def is_work_time(post_time):
-    """Рабочее время: все дни и часы, кроме выходного периода"""
     return not is_weekend_period(post_time)
 
 def task_link(chat_id, message_id):
@@ -173,7 +169,6 @@ def reset_telegram_webhook(token):
         logger.error(f"Error resetting webhook: {e}")
 
 def get_non_completers(chat_id, task_id, author_id, author_name):
-    """Возвращает строку со списком участников, не выполнивших задание"""
     with db_lock:
         cursor.execute("SELECT user_id FROM completions WHERE task_id=? AND chat_id=?", (task_id, chat_id))
         done_user_ids = {row[0] for row in cursor.fetchall()}
@@ -273,6 +268,10 @@ def process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
             logger.error(f"Failed to send completion report: {e}")
 
 # ==================== КОМАНДЫ ====================
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    bot.send_message(message.chat.id, "Привет! Я бот взаимной активности. Теперь я могу отправлять вам ссылки на задания. Используйте меня в чатах.")
+
 @bot.message_handler(commands=['stats'])
 def stats(message):
     if message.chat.type != "private":
@@ -321,7 +320,7 @@ def my_tasks(message):
     filtered = []
     for task in tasks:
         chat_id = task[0]
-        status = get_cached_member(chat_id, user_id)
+        status = get_cached_member(chat_id, user_id, force_refresh=True)
         if status in ["left", "kicked", None]:
             continue
         if status in ["administrator", "creator"]:
@@ -357,7 +356,7 @@ def howto(message):
     instruction = (
         "📖 *Инструкция по выполнению заданий*\n\n"
         "1️⃣ Бот публикует задание с кнопкой «🔗 Перейти к заданию».\n\n"
-        "2️⃣ Нажмите эту кнопку – бот отправит ссылку на актив в *личные сообщения*.\n\n"
+        "2️⃣ Нажмите эту кнопку – бот *сразу засчитает* вам задание и отправит ссылку на актив в *личные сообщения*.\n\n"
         "3️⃣ Перейдите по ссылке и выполните актив (лайк, репост, подписка и т.п.).\n\n"
         "4️⃣ Задание считается выполненным сразу после нажатия кнопки. Ссылка остаётся у вас в личке.\n\n"
         "⚠️ Если вы нажмёте кнопку повторно, бот просто отправит ссылку ещё раз – ошибки не будет.\n\n"
@@ -473,11 +472,19 @@ def handle_goto(call):
     chat_id = call.message.chat.id
     now = int(time.time())
 
+    # Проверяем, может ли бот отправить сообщение пользователю
+    try:
+        bot.send_chat_action(user_id, 'typing')
+    except Exception as e:
+        logger.warning(f"Cannot send message to user {user_id}: {e}")
+        bot.answer_callback_query(call.id, "❌ Не могу отправить вам ссылку в личные сообщения. Напишите боту /start и повторите попытку.")
+        return
+
     with db_lock:
         cursor.execute("SELECT link, author, created FROM tasks WHERE id=?", (task_id,))
         row = cursor.fetchone()
         if not row:
-            bot.answer_callback_query(call.id, "❌ Задание устарело или было удалено. Создайте новое.")
+            bot.answer_callback_query(call.id, "❌ Задание устарело или было удалено.")
             return
         original_link, author_id, created = row
 
@@ -487,42 +494,45 @@ def handle_goto(call):
         if now - created < 10:
             bot.answer_callback_query(call.id, "⏳ Подождите 10 секунд после создания задания")
             return
-        status = get_cached_member(chat_id, user_id)
+
+        status = get_cached_member(chat_id, user_id, force_refresh=True)
         if status not in ["member", "administrator", "creator"]:
-            bot.answer_callback_query(call.id, "❌ Вы не состоите в этом чате")
+            bot.answer_callback_query(call.id, "❌ Вы не состоите в этом чате или бот не может проверить. Попробуйте позже.")
             return
 
         cursor.execute("SELECT * FROM completions WHERE task_id=? AND user_id=? AND chat_id=?", (task_id, user_id, chat_id))
-        if cursor.fetchone():
+        already_done = cursor.fetchone()
+
+        if already_done:
             bot.answer_callback_query(call.id, "ℹ️ Вы уже выполнили это задание. Ссылка повторно отправлена в личные сообщения.")
             try:
                 bot.send_message(user_id, f"🔗 Повторная ссылка на задание из чата {call.message.chat.title}:\n{original_link}\n\nВы уже получили за него актив. Спасибо!")
             except Exception as e:
                 logger.error(f"Failed to resend link to {user_id}: {e}")
             return
+        else:
+            cursor.execute("INSERT OR REPLACE INTO link_clicks (task_id, user_id, chat_id, clicked) VALUES (?, ?, ?, 1)", (task_id, user_id, chat_id))
+            cursor.execute(
+                "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) VALUES (?, ?, ?, ?, ?, 1)",
+                (task_id, chat_id, user_id, call.from_user.username, now)
+            )
+            cursor.execute(
+                "INSERT OR REPLACE INTO users (id, chat_id, username, last_active) VALUES (?, ?, ?, ?)",
+                (user_id, chat_id, call.from_user.username, now)
+            )
+            conn.commit()
 
-        cursor.execute("INSERT OR REPLACE INTO link_clicks (task_id, user_id, chat_id, clicked) VALUES (?, ?, ?, 1)", (task_id, user_id, chat_id))
-        cursor.execute(
-            "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) VALUES (?, ?, ?, ?, ?, 1)",
-            (task_id, chat_id, user_id, call.from_user.username, now)
-        )
-        cursor.execute(
-            "INSERT OR REPLACE INTO users (id, chat_id, username, last_active) VALUES (?, ?, ?, ?)",
-            (user_id, chat_id, call.from_user.username, now)
-        )
-        conn.commit()
-
-    bot.answer_callback_query(call.id, "✅ Ссылка на актив отправлена в личные сообщения.")
-    try:
-        bot.send_message(
-            user_id,
-            f"🔗 Вот ссылка на актив из чата {call.message.chat.title}:\n{original_link}\n\n"
-            "👉 Перейдите по ней и поддержите автора (актив, который попросил автор).\n"
-            "Благодарим за участие!"
-        )
-    except Exception as e:
-        logger.error(f"Failed to send link to user {user_id}: {e}")
-        bot.answer_callback_query(call.id, "❌ Не удалось отправить ссылку в ЛС. Напишите боту /start и нажмите кнопку ещё раз.")
+            bot.answer_callback_query(call.id, "✅ Задание засчитано! Ссылка на актив отправлена в личные сообщения.")
+            try:
+                bot.send_message(
+                    user_id,
+                    f"🔗 Вот ссылка на актив из чата {call.message.chat.title}:\n{original_link}\n\n"
+                    "👉 Перейдите по ней и поддержите автора (лайк, репост и т.п.).\n"
+                    "Благодарим за участие!"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send link to user {user_id}: {e}")
+                bot.answer_callback_query(call.id, "❌ Не удалось отправить ссылку в ЛС. Напишите боту /start и нажмите кнопку ещё раз.")
 
 # ==================== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ====================
 @bot.message_handler(func=lambda m: True)
@@ -547,11 +557,9 @@ def handle_message(message):
         )
         conn.commit()
 
-    # Нерабочее время (выходные) – ничего не делаем, не удаляем сообщения
     if not is_work_time(message.date):
         return
 
-    # Рабочее время: проверяем наличие ссылки
     match = re.search(link_pattern, message.text)
     if not match:
         if not is_user_admin:
@@ -626,7 +634,7 @@ def send_update_notification():
                 "1️⃣ Нажать кнопку *«Перейти к заданию»* под сообщением задания.\n"
                 "2️⃣ Получить ссылку в личные сообщения и перейти по ней.\n"
                 "3️⃣ Выполнить актив.\n\n"
-                "Инструкция: /howto\n"
+                "Задание засчитывается автоматически после нажатия кнопки. Инструкция: /howto\n"
                 "Если вы нажмёте кнопку повторно, бот просто отправит ссылку ещё раз.\n\n"
                 "Спасибо за понимание!",
                 parse_mode='Markdown'
@@ -645,7 +653,6 @@ def scheduler():
         hour = now_dt.hour
         week_num = now_dt.isocalendar()[1]
 
-        # Пятничное напоминание (23:00)
         if day == 4 and hour == 23:
             last_friday = get_state("last_friday_week")
             if last_friday != str(week_num):
@@ -659,7 +666,6 @@ def scheduler():
                         logger.error(f"Failed to send friday message in {chat_id}: {e}")
                 set_state("last_friday_week", week_num)
 
-        # Понедельничное приветствие (7:00)
         if day == 0 and hour == 7:
             last_monday = get_state("last_monday_week")
             if last_monday != str(week_num):
@@ -673,7 +679,6 @@ def scheduler():
                         logger.error(f"Failed to send monday message in {chat_id}: {e}")
                 set_state("last_monday_week", week_num)
 
-        # Обработка истекших заданий только в рабочее время (не выходные)
         if is_work_time(now):
             with db_lock:
                 cursor.execute("SELECT id, chat_id, author, author_name, message_id, link, created FROM tasks WHERE created <= ?", (now - TASK_LIFETIME,))
@@ -685,7 +690,6 @@ def scheduler():
                     cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                     conn.commit()
 
-        # Недельный отчёт (воскресенье, 12:00)
         if day == 6 and hour == 12:
             last_report = get_state("last_report_week")
             if last_report != str(week_num):
