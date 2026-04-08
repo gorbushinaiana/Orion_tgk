@@ -130,33 +130,26 @@ def msk_now():
     return datetime.datetime.now(MSK)
 
 def is_weekend_period(now_ts=None):
+    """Возвращает True, если сейчас с пятницы 23:00 до понедельника 7:00 MSK"""
     if now_ts is None:
         now_ts = int(time.time())
     dt = datetime.datetime.fromtimestamp(now_ts, tz=MSK)
     weekday = dt.weekday()
     hour = dt.hour
+    # Пятница после 23:00
     if weekday == 4 and hour >= 23:
         return True
+    # Суббота и воскресенье целиком
     if weekday == 5 or weekday == 6:
         return True
+    # Понедельник до 7:00
     if weekday == 0 and hour < 7:
         return True
     return False
 
 def is_work_time(post_time):
-    if is_weekend_period(post_time):
-        return False
-    dt = datetime.datetime.fromtimestamp(post_time, tz=MSK)
-    weekday = dt.weekday()
-    hour = dt.hour
-    if weekday == 0:
-        return hour >= 7
-    elif 1 <= weekday <= 3:
-        return True
-    elif weekday == 4:
-        return hour < 23
-    else:
-        return False
+    """Рабочее время: все дни и часы, кроме выходного периода"""
+    return not is_weekend_period(post_time)
 
 def task_link(chat_id, message_id):
     if message_id and chat_id < 0:
@@ -185,21 +178,40 @@ def get_non_completers(chat_id, task_id, author_id, author_name):
         cursor.execute("SELECT user_id FROM completions WHERE task_id=? AND chat_id=?", (task_id, chat_id))
         done_user_ids = {row[0] for row in cursor.fetchall()}
         cursor.execute("SELECT id, username FROM users WHERE chat_id=?", (chat_id,))
-        all_users = cursor.fetchall()
+        users_in_db = {row[0]: row[1] for row in cursor.fetchall()}
 
-    not_done = []
-    for uid, uname in all_users:
-        if uid == author_id:
-            continue
+    try:
+        members = bot.get_chat_members(chat_id, limit=200)
+        real_member_ids = {member.user.id for member in members if not member.user.is_bot}
+        all_user_ids = set(users_in_db.keys()) | real_member_ids
+    except Exception as e:
+        logger.warning(f"Failed to get chat members for {chat_id}, fallback to users table: {e}")
+        all_user_ids = set(users_in_db.keys())
+
+    all_user_ids.discard(author_id)
+
+    admin_ids = set()
+    for uid in list(all_user_ids):
         if is_admin_cached(chat_id, uid):
-            continue
-        if uid in done_user_ids:
-            continue
-        status = get_cached_member(chat_id, uid)
-        if status in ["member", "administrator", "creator"]:
-            mention = f"@{uname}" if uname else f"id{uid}"
-            not_done.append(mention)
-    return ", ".join(not_done) if not_done else "Все выполнили"
+            admin_ids.add(uid)
+    all_user_ids -= admin_ids
+
+    not_done_ids = all_user_ids - done_user_ids
+
+    not_done_list = []
+    for uid in not_done_ids:
+        uname = users_in_db.get(uid)
+        if not uname:
+            try:
+                user = bot.get_chat_member(chat_id, uid).user
+                uname = user.username if user.username else f"id{uid}"
+            except:
+                uname = f"id{uid}"
+        else:
+            uname = f"@{uname}" if uname else f"id{uid}"
+        not_done_list.append(uname)
+
+    return ", ".join(not_done_list) if not_done_list else "Все выполнили"
 
 # ==================== ОБРАБОТКА ИСТЕКШИХ ЗАДАНИЙ ====================
 def process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link):
@@ -345,7 +357,7 @@ def howto(message):
     instruction = (
         "📖 *Инструкция по выполнению заданий*\n\n"
         "1️⃣ Бот публикует задание с кнопкой «🔗 Перейти к заданию».\n\n"
-        "2️⃣ Нажмите эту кнопку – бот *сразу засчитает* вам задание и отправит ссылку на актив в *личные сообщения*.\n\n"
+        "2️⃣ Нажмите эту кнопку – бот отправит ссылку на актив в *личные сообщения*.\n\n"
         "3️⃣ Перейдите по ссылке и выполните актив (лайк, репост, подписка и т.п.).\n\n"
         "4️⃣ Задание считается выполненным сразу после нажатия кнопки. Ссылка остаётся у вас в личке.\n\n"
         "⚠️ Если вы нажмёте кнопку повторно, бот просто отправит ссылку ещё раз – ошибки не будет.\n\n"
@@ -390,7 +402,6 @@ def export_csv(message):
     chat_id = message.chat.id
     is_private = message.chat.type == "private"
 
-    # Определяем чаты для выгрузки
     if is_private:
         with db_lock:
             cursor.execute("SELECT DISTINCT chat_id FROM users WHERE id=?", (user_id,))
@@ -501,7 +512,7 @@ def handle_goto(call):
         )
         conn.commit()
 
-    bot.answer_callback_query(call.id, "✅ Задание засчитано! Ссылка на актив отправлена в личные сообщения.")
+    bot.answer_callback_query(call.id, "✅ Ссылка на актив отправлена в личные сообщения.")
     try:
         bot.send_message(
             user_id,
@@ -536,14 +547,11 @@ def handle_message(message):
         )
         conn.commit()
 
+    # Нерабочее время (выходные) – ничего не делаем, не удаляем сообщения
     if not is_work_time(message.date):
-        if not is_user_admin:
-            try:
-                bot.delete_message(chat_id, message.message_id)
-            except Exception as e:
-                logger.warning(f"Failed to delete message: {e}")
         return
 
+    # Рабочее время: проверяем наличие ссылки
     match = re.search(link_pattern, message.text)
     if not match:
         if not is_user_admin:
@@ -618,7 +626,7 @@ def send_update_notification():
                 "1️⃣ Нажать кнопку *«Перейти к заданию»* под сообщением задания.\n"
                 "2️⃣ Получить ссылку в личные сообщения и перейти по ней.\n"
                 "3️⃣ Выполнить актив.\n\n"
-                "Задание засчитывается автоматически после нажатия кнопки. Инструкция: /howto\n"
+                "Инструкция: /howto\n"
                 "Если вы нажмёте кнопку повторно, бот просто отправит ссылку ещё раз.\n\n"
                 "Спасибо за понимание!",
                 parse_mode='Markdown'
@@ -637,6 +645,7 @@ def scheduler():
         hour = now_dt.hour
         week_num = now_dt.isocalendar()[1]
 
+        # Пятничное напоминание (23:00)
         if day == 4 and hour == 23:
             last_friday = get_state("last_friday_week")
             if last_friday != str(week_num):
@@ -650,6 +659,7 @@ def scheduler():
                         logger.error(f"Failed to send friday message in {chat_id}: {e}")
                 set_state("last_friday_week", week_num)
 
+        # Понедельничное приветствие (7:00)
         if day == 0 and hour == 7:
             last_monday = get_state("last_monday_week")
             if last_monday != str(week_num):
@@ -663,7 +673,8 @@ def scheduler():
                         logger.error(f"Failed to send monday message in {chat_id}: {e}")
                 set_state("last_monday_week", week_num)
 
-        if not is_weekend_period(now):
+        # Обработка истекших заданий только в рабочее время (не выходные)
+        if is_work_time(now):
             with db_lock:
                 cursor.execute("SELECT id, chat_id, author, author_name, message_id, link, created FROM tasks WHERE created <= ?", (now - TASK_LIFETIME,))
                 expired = cursor.fetchall()
@@ -674,6 +685,7 @@ def scheduler():
                     cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                     conn.commit()
 
+        # Недельный отчёт (воскресенье, 12:00)
         if day == 6 and hour == 12:
             last_report = get_state("last_report_week")
             if last_report != str(week_num):
