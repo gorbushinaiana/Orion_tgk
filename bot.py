@@ -11,6 +11,8 @@ from collections import defaultdict
 import logging
 import signal
 import sys
+import csv
+import io
 
 # ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
 logging.basicConfig(
@@ -176,6 +178,28 @@ def reset_telegram_webhook(token):
             logger.error(f"Webhook reset failed: {resp.text}")
     except Exception as e:
         logger.error(f"Error resetting webhook: {e}")
+
+def get_non_completers(chat_id, task_id, author_id, author_name):
+    """Возвращает строку со списком участников, не выполнивших задание"""
+    with db_lock:
+        cursor.execute("SELECT user_id FROM completions WHERE task_id=? AND chat_id=?", (task_id, chat_id))
+        done_user_ids = {row[0] for row in cursor.fetchall()}
+        cursor.execute("SELECT id, username FROM users WHERE chat_id=?", (chat_id,))
+        all_users = cursor.fetchall()
+
+    not_done = []
+    for uid, uname in all_users:
+        if uid == author_id:
+            continue
+        if is_admin_cached(chat_id, uid):
+            continue
+        if uid in done_user_ids:
+            continue
+        status = get_cached_member(chat_id, uid)
+        if status in ["member", "administrator", "creator"]:
+            mention = f"@{uname}" if uname else f"id{uid}"
+            not_done.append(mention)
+    return ", ".join(not_done) if not_done else "Все выполнили"
 
 # ==================== ОБРАБОТКА ИСТЕКШИХ ЗАДАНИЙ ====================
 def process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link):
@@ -360,6 +384,76 @@ def broadcast(message):
             logger.error(f"Failed to broadcast to {chat_id}: {e}")
     bot.send_message(message.chat.id, f"📢 Сообщение отправлено в {sent} чатов.")
 
+@bot.message_handler(commands=['export_csv'])
+def export_csv(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    is_private = message.chat.type == "private"
+
+    # Определяем чаты для выгрузки
+    if is_private:
+        with db_lock:
+            cursor.execute("SELECT DISTINCT chat_id FROM users WHERE id=?", (user_id,))
+            all_chats = [row[0] for row in cursor.fetchall()]
+        admin_chats = [cid for cid in all_chats if is_admin_cached(cid, user_id)]
+        if not admin_chats:
+            bot.send_message(user_id, "❌ Вы не администратор ни в одном из чатов, где есть бот.")
+            return
+        target_chats = admin_chats
+    else:
+        if not is_admin_cached(chat_id, user_id):
+            bot.send_message(chat_id, "❌ Команда доступна только администраторам чата.")
+            return
+        target_chats = [chat_id]
+
+    bot.send_message(user_id if is_private else chat_id, "📤 Формирую CSV-файл...")
+
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow(["Название чата", "Ссылка на задание (бот)", "Ссылка на пост автора", "Кто не выполнил"])
+
+    now = int(time.time())
+    total_rows = 0
+
+    for cid in target_chats:
+        try:
+            chat_info = bot.get_chat(cid)
+            chat_title = chat_info.title if chat_info else str(cid)
+        except:
+            chat_title = str(cid)
+
+        with db_lock:
+            cursor.execute("""
+                SELECT id, author, author_name, link, message_id
+                FROM tasks
+                WHERE chat_id = ? AND created > ?
+                ORDER BY created DESC
+            """, (cid, now - TASK_LIFETIME))
+            tasks = cursor.fetchall()
+
+        if not tasks:
+            writer.writerow([chat_title, "Нет активных заданий", "", ""])
+            total_rows += 1
+            continue
+
+        for task in tasks:
+            task_id, author_id, author_name, original_link, msg_id = task
+            bot_link = task_link(cid, msg_id) or (f"https://t.me/c/{str(cid)[4:]}/{msg_id}" if msg_id else "Недоступно")
+            non_completers = get_non_completers(cid, task_id, author_id, author_name)
+            writer.writerow([chat_title, bot_link, original_link, non_completers])
+            total_rows += 1
+
+    output.seek(0)
+    try:
+        bot.send_document(
+            user_id if is_private else chat_id,
+            ('tasks_export.csv', output.getvalue().encode('utf-8-sig'))
+        )
+        bot.send_message(user_id if is_private else chat_id, f"✅ Выгрузка завершена. Записано {total_rows} строк.")
+    except Exception as e:
+        logger.error(f"Failed to send CSV: {e}")
+        bot.send_message(user_id if is_private else chat_id, "❌ Ошибка при отправке файла.")
+
 # ==================== ОСНОВНОЙ ОБРАБОТЧИК КНОПКИ ====================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("goto_"))
 def handle_goto(call):
@@ -376,7 +470,6 @@ def handle_goto(call):
             return
         original_link, author_id, created = row
 
-        # Проверки
         if user_id == author_id:
             bot.answer_callback_query(call.id, "❌ Нельзя выполнить своё задание")
             return
@@ -388,10 +481,8 @@ def handle_goto(call):
             bot.answer_callback_query(call.id, "❌ Вы не состоите в этом чате")
             return
 
-        # Проверяем, не выполнено ли уже
         cursor.execute("SELECT * FROM completions WHERE task_id=? AND user_id=? AND chat_id=?", (task_id, user_id, chat_id))
         if cursor.fetchone():
-            # Уже выполнено – повторно отправляем ссылку (полезно, если пользователь потерял)
             bot.answer_callback_query(call.id, "ℹ️ Вы уже выполнили это задание. Ссылка повторно отправлена в личные сообщения.")
             try:
                 bot.send_message(user_id, f"🔗 Повторная ссылка на задание из чата {call.message.chat.title}:\n{original_link}\n\nВы уже получили за него актив. Спасибо!")
@@ -399,7 +490,6 @@ def handle_goto(call):
                 logger.error(f"Failed to resend link to {user_id}: {e}")
             return
 
-        # Фиксируем переход и засчитываем выполнение
         cursor.execute("INSERT OR REPLACE INTO link_clicks (task_id, user_id, chat_id, clicked) VALUES (?, ?, ?, 1)", (task_id, user_id, chat_id))
         cursor.execute(
             "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) VALUES (?, ?, ?, ?, ?, 1)",
@@ -513,7 +603,6 @@ def set_state(key, value):
         conn.commit()
 
 def send_update_notification():
-    """Один раз отправляет в каждый чат уведомление об обновлении бота (одна кнопка)"""
     with db_lock:
         cursor.execute("SELECT DISTINCT chat_id FROM users")
         chats = [row[0] for row in cursor.fetchall()]
