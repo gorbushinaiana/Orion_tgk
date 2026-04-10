@@ -115,9 +115,7 @@ def task_link(chat_id, message_id):
 
 def get_task_keyboard(task_id, original_link):
     markup = telebot.types.InlineKeyboardMarkup(row_width=1)
-    # Кнопка-ссылка (открывает оригинальный пост)
     markup.add(telebot.types.InlineKeyboardButton("🔗 Открыть задание", url=original_link))
-    # Кнопка подтверждения
     markup.add(telebot.types.InlineKeyboardButton("✅ Я выполнил", callback_data=f"done_{task_id}"))
     return markup
 
@@ -144,23 +142,41 @@ def is_admin(chat_id, user_id):
         logger.warning(f"Failed to check admin status for {user_id} in {chat_id}: {e}")
         return False
 
+def get_all_chat_members(chat_id):
+    """Получает полный список участников чата с обходом ограничения в 200"""
+    members = []
+    try:
+        offset = 0
+        while True:
+            chunk = bot.get_chat_members(chat_id, limit=200, offset=offset)
+            if not chunk:
+                break
+            members.extend(chunk)
+            offset += len(chunk)
+            if len(chunk) < 200:
+                break
+            time.sleep(0.1)
+    except Exception as e:
+        logger.error(f"Failed to get all chat members for {chat_id}: {e}")
+    return members
+
 def get_non_completers(chat_id, task_id, author_id, author_name):
+    """Возвращает строку со списком участников, не выполнивших задание"""
     with db_lock:
         cursor.execute("SELECT user_id FROM completions WHERE task_id=? AND chat_id=?", (task_id, chat_id))
         done_user_ids = {row[0] for row in cursor.fetchall()}
         cursor.execute("SELECT id, username FROM users WHERE chat_id=?", (chat_id,))
         users_in_db = {row[0]: row[1] for row in cursor.fetchall()}
 
-    try:
-        members = bot.get_chat_members(chat_id, limit=200)
-        real_member_ids = {member.user.id for member in members if not member.user.is_bot}
-        all_user_ids = set(users_in_db.keys()) | real_member_ids
-    except Exception as e:
-        logger.warning(f"Failed to get chat members for {chat_id}, fallback to users table: {e}")
-        all_user_ids = set(users_in_db.keys())
+    # Получаем ВСЕХ участников чата
+    all_members = get_all_chat_members(chat_id)
+    all_user_ids = {member.user.id for member in all_members if not member.user.is_bot}
+    all_user_ids |= set(users_in_db.keys())
 
+    # Исключаем автора
     all_user_ids.discard(author_id)
 
+    # Исключаем администраторов
     admin_ids = set()
     for uid in list(all_user_ids):
         if is_admin(chat_id, uid):
@@ -173,10 +189,10 @@ def get_non_completers(chat_id, task_id, author_id, author_name):
     for uid in not_done_ids:
         uname = users_in_db.get(uid)
         if not uname:
-            try:
-                user = bot.get_chat_member(chat_id, uid).user
-                uname = user.username if user.username else f"id{uid}"
-            except:
+            member = next((m for m in all_members if m.user.id == uid), None)
+            if member and member.user.username:
+                uname = f"@{member.user.username}"
+            else:
                 uname = f"id{uid}"
         else:
             uname = f"@{uname}" if uname else f"id{uid}"
@@ -470,13 +486,11 @@ def handle_done(call):
             bot.answer_callback_query(call.id, "⏳ Подождите 10 секунд после создания задания")
             return
 
-        # Проверяем, не выполнено ли уже
         cursor.execute("SELECT * FROM completions WHERE task_id=? AND user_id=? AND chat_id=?", (task_id, user_id, chat_id))
         if cursor.fetchone():
             bot.answer_callback_query(call.id, "ℹ️ Вы уже выполнили это задание")
             return
 
-        # Засчитываем выполнение
         cursor.execute(
             "INSERT INTO completions (task_id, chat_id, user_id, username, time, verified) VALUES (?, ?, ?, ?, ?, 1)",
             (task_id, chat_id, user_id, call.from_user.username, now)
@@ -546,7 +560,6 @@ def handle_message(message):
         task_id = cursor.lastrowid
         conn.commit()
 
-    # Отправляем сообщение с двумя кнопками
     sent = bot.send_message(
         chat_id,
         f"📢 Новое задание\n\n@{username}\n{activity}\n\n⬇️ Перейдите по ссылке, выполните актив и нажмите подтверждение.",
@@ -723,4 +736,4 @@ if __name__ == "__main__":
                 time.sleep(30)
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
-            time.sleep(30)
+            time
