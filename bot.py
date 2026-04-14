@@ -86,6 +86,37 @@ with db_lock:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_chat_id ON tasks(chat_id)")
     conn.commit()
 
+# ==================== КЭШ ДЛЯ is_admin ====================
+_admin_cache = {}
+_ADMIN_CACHE_TTL = 300
+
+def is_admin(chat_id, user_id):
+    # Глобальные админы из переменной окружения
+    admin_ids = os.environ.get("ADMIN_IDS", "")
+    if admin_ids:
+        admin_list = [int(x.strip()) for x in admin_ids.split(",") if x.strip().isdigit()]
+        if user_id in admin_list:
+            return True
+    if chat_id is None:
+        return False
+
+    cache_key = (chat_id, user_id)
+    now = time.time()
+    if cache_key in _admin_cache:
+        status, ts = _admin_cache[cache_key]
+        if now - ts < _ADMIN_CACHE_TTL:
+            return status
+
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        result = member.status in ["administrator", "creator"]
+        _admin_cache[cache_key] = (result, now)
+        return result
+    except Exception as e:
+        logger.warning(f"Failed to check admin status for {user_id} in {chat_id}: {e}")
+        # При ошибке считаем, что пользователь НЕ администратор
+        return False
+
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def msk_now():
     return datetime.datetime.now(MSK)
@@ -128,19 +159,6 @@ def reset_telegram_webhook(token):
             logger.error(f"Webhook reset failed: {resp.text}")
     except Exception as e:
         logger.error(f"Error resetting webhook: {e}")
-
-def is_admin(chat_id, user_id):
-    admin_ids = os.environ.get("ADMIN_IDS", "")
-    if admin_ids:
-        admin_list = [int(x.strip()) for x in admin_ids.split(",") if x.strip().isdigit()]
-        if user_id in admin_list:
-            return True
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        return member.status in ["administrator", "creator"]
-    except Exception as e:
-        logger.warning(f"Failed to check admin status for {user_id} in {chat_id}: {e}")
-        return False
 
 def get_all_chat_members(chat_id):
     """Получает полный список участников чата с обходом ограничения в 200"""
@@ -200,35 +218,56 @@ def get_non_completers(chat_id, task_id, author_id, author_name):
 
     return ", ".join(not_done_list) if not_done_list else "Все выполнили"
 
-# ==================== ОБРАБОТКА ИСТЕКШИХ ЗАДАНИЙ ====================
+# ==================== ОБРАБОТКА ИСТЕКШИХ ЗАДАНИЙ (исправлена) ====================
 def process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link):
     logger.info(f"Processing expired task {task_id} in chat {chat_id}")
     with db_lock:
-        cursor.execute("SELECT username FROM completions WHERE task_id=? AND chat_id=?", (task_id, chat_id))
-        done_users = {row[0] for row in cursor.fetchall()}
-        cursor.execute("SELECT username, id FROM users WHERE chat_id=?", (chat_id,))
-        all_users = {row[0]: row[1] for row in cursor.fetchall()}
+        cursor.execute("SELECT user_id FROM completions WHERE task_id=? AND chat_id=?", (task_id, chat_id))
+        done_user_ids = {row[0] for row in cursor.fetchall()}
 
-    not_done = []
-    for uname, uid in all_users.items():
-        if uname == author_name or is_admin(chat_id, uid):
-            continue
-        if uname in done_users:
-            continue
-        try:
-            member = bot.get_chat_member(chat_id, uid)
-            if member.status in ["member", "administrator", "creator"]:
-                mention = f"@{uname}" if uname else f"id{uid}"
-                not_done.append(mention)
-        except:
-            continue
+    # Получаем всех участников чата (как в get_non_completers)
+    all_members = get_all_chat_members(chat_id)
+    all_user_ids = {member.user.id for member in all_members if not member.user.is_bot}
+    with db_lock:
+        cursor.execute("SELECT id FROM users WHERE chat_id=?", (chat_id,))
+        db_user_ids = {row[0] for row in cursor.fetchall()}
+    all_user_ids |= db_user_ids
+
+    # Исключаем автора
+    all_user_ids.discard(author_id)
+
+    # Исключаем администраторов
+    admin_ids = set()
+    for uid in list(all_user_ids):
+        if is_admin(chat_id, uid):
+            admin_ids.add(uid)
+    all_user_ids -= admin_ids
+
+    not_done_ids = all_user_ids - done_user_ids
+
+    # Формируем список упоминаний
+    not_done_list = []
+    for uid in not_done_ids:
+        member = next((m for m in all_members if m.user.id == uid), None)
+        if member and member.user.username:
+            uname = f"@{member.user.username}"
+        else:
+            with db_lock:
+                cursor.execute("SELECT username FROM users WHERE id=? AND chat_id=?", (uid, chat_id))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    uname = f"@{row[0]}"
+                else:
+                    uname = f"id{uid}"
+        not_done_list.append(uname)
 
     link_msg = task_link(chat_id, msg_id) or link
 
-    if not_done:
+    if not_done_list:
+        # Отправляем порциями
         chunk = []
         chunk_len = 0
-        for mention in not_done:
+        for mention in not_done_list:
             mention_with_newline = mention + "\n"
             if chunk_len + len(mention_with_newline) > 4000:
                 text = "❌ Не выполнили задание"
@@ -656,9 +695,10 @@ def scheduler():
             for task in expired:
                 task_id, chat_id, author_id, author_name, msg_id, link, created = task
                 process_expired_task(task_id, chat_id, author_id, author_name, msg_id, link)
-                with db_lock:
-                    cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-                    conn.commit()
+                # Удаление заданий ОТКЛЮЧЕНО (задания остаются в БД для истории)
+                # with db_lock:
+                #     cursor.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+                #     conn.commit()
 
         if day == 6 and hour == 12:
             last_report = get_state("last_report_week")
@@ -736,4 +776,4 @@ if __name__ == "__main__":
                 time.sleep(30)
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
-            time
+            time.sleep(30)
